@@ -1,0 +1,105 @@
+name: build-installer
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      llama_tag:
+        description: "llama.cpp release tag to bundle (e.g. b6900) or 'latest'. Pin a tag once you have verified MedGemma multimodal works with it."
+        default: "latest"
+
+permissions:
+  contents: write   # needed only to attach installers to a tagged release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # false = small installer (needs WebView2 already on the PC; Win11 and updated Win10 have it)
+        # true  = +~170 MB offline WebView2 runtime, installs on a clean Win10/LTSC with zero internet
+        bundle_webview2: [false, true]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LLAMA_TAG: ${{ inputs.llama_tag || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit-test selection / hardware / backend logic
+        run: cargo test -p mg-core
+
+      - name: Build UI + native shell (Tauri, exe only - Inno Setup does the installing)
+        run: |
+          npm ci
+          npx tauri build --no-bundle
+
+      - name: Build installer helper (hardware probe + model selector)
+        run: cargo build --release -p mg-probe
+
+      - name: Fetch llama.cpp inference engines (CPU + Vulkan GPU)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-Engine($patterns, $name) {
+            $dl = "dl\$name"; New-Item -ItemType Directory -Force $dl | Out-Null
+            foreach ($p in $patterns) {
+              $args = @('release','download','-R','ggml-org/llama.cpp','-p',$p,'-D',$dl,'--clobber')
+              if ($env:LLAMA_TAG -ne 'latest') { $args = @('release','download',$env:LLAMA_TAG) + $args[2..($args.Length-1)] }
+              gh @args
+              if (Get-ChildItem $dl -Filter *.zip -ErrorAction SilentlyContinue) { break }
+            }
+            $zip = Get-ChildItem $dl -Filter *.zip | Select-Object -First 1
+            if (-not $zip) { throw "No llama.cpp asset matched for $name" }
+            Expand-Archive $zip.FullName "$dl\x" -Force
+            $out = "staging\backend\$name"; New-Item -ItemType Directory -Force $out | Out-Null
+            Get-ChildItem "$dl\x" -Recurse -File | Where-Object { $_.Extension -in '.dll','.exe' } | ForEach-Object { Copy-Item $_.FullName $out -Force }
+            Get-ChildItem $out -Filter *.exe | Where-Object { $_.Name -ne 'llama-server.exe' } | Remove-Item   # drop unused tools (size)
+            if (-not (Test-Path "$out\llama-server.exe")) { throw "llama-server.exe missing in $name build" }
+            "{0}: {1:N1} MB" -f $name, ((Get-ChildItem $out -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+          }
+          Get-Engine @('llama-*-bin-win-cpu-x64.zip','llama-*-bin-win-avx2-x64.zip') 'cpu'
+          Get-Engine @('llama-*-bin-win-vulkan-x64.zip') 'vulkan'
+
+      - name: Stage files for the installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging\app | Out-Null
+          Copy-Item target\release\medgemma-offline.exe staging\app\
+          Copy-Item target\release\mg-probe.exe staging\
+          if ('${{ matrix.bundle_webview2 }}' -eq 'true') {
+            # Evergreen *Standalone* x64 installer (works offline on the target PC)
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2124701' -OutFile staging\MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+            if ((Get-Item staging\MicrosoftEdgeWebView2RuntimeInstallerX64.exe).Length -lt 100MB) { throw 'WebView2 standalone download looks wrong' }
+          }
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0-ci' }
+          $defs = @("/DAppVersion=$ver")
+          if ('${{ matrix.bundle_webview2 }}' -eq 'true') { $defs += '/DBundleWebView2' }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @defs installer\medgemma.iss
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
+          Get-ChildItem out | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB) }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MedGemmaOffline-installer-${{ matrix.bundle_webview2 && 'with-webview2' || 'slim' }}
+          path: out/*.exe
+          compression-level: 0     # already LZMA2-compressed
+
+      - name: Attach to GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.exe
