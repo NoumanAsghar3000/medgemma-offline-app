@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MedGemma Offline</title>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="brand"><span class="logo">+</span> MedGemma <small>offline</small></div>
+      <div id="badge" class="badge">starting…</div>
+    </header>
+
+    <main id="messages" aria-live="polite">
+      <div class="empty" id="empty">
+        <h1>How can I help?</h1>
+        <p>Ask a clinical question, or attach a lab report, X-ray, scan or photo with the <b>+</b> button.<br/>Everything runs on this computer - no internet needed.</p>
+      </div>
+    </main>
+
+    <footer id="composer">
+      <div id="chips"></div>
+      <div class="row">
+        <div class="plus-wrap">
+          <button id="plus" class="icon-btn" title="Add" aria-haspopup="true">+</button>
+          <div id="menu" class="menu" hidden>
+            <button id="m-file">📎 Attach file</button>
+            <button id="m-cam">📷 Camera</button>
+          </div>
+        </div>
+        <textarea id="input" rows="1" placeholder="Message MedGemma…"></textarea>
+        <button id="send" class="send" title="Send">➤</button>
+      </div>
+      <div class="hint">AI output can be wrong. It supports - never replaces - a clinician's judgement.</div>
+      <input id="file" type="file" multiple hidden
+        accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff,.csv,.docx,.txt,.md,.json,.tsv,image/*,application/pdf" />
+    </footer>
+  </div>
+
+  <div id="gate" class="overlay" hidden><div class="dialog" id="gate-body"></div></div>
+
+  <div id="cam" class="overlay" hidden>
+    <div class="dialog cam">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="cam-err" class="red"></div>
+      <div class="btns"><button id="cam-cancel" class="ghost">Cancel</button><button id="cam-shot" class="primary">Capture &amp; attach</button></div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
