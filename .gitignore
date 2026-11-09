@@ -1,0 +1,8 @@
+node_modules/
+dist/
+target/
+out/
+staging/
+dl/
+src-tauri/gen/
+*.gguf
