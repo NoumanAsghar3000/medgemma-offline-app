@@ -1,0 +1,10 @@
+[package]
+name = "mg-probe"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+mg-core = { path = "../mg-core" }
+
+[features]
+relax-ram-for-tests = ["mg-core/relax-ram-for-tests"]
