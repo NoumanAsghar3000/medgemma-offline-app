@@ -104,6 +104,8 @@ jobs:
         bundle_webview2: [false, true]
     env:
       GH_TOKEN: ${{ github.token }}
+      # read by tools/sign.ps1 (also when Inno Setup calls it to sign the installer + uninstaller)
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -112,6 +114,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+
+      # ---- code signing: decode the PFX from the secret, sanity-check it, locate signtool.exe ----
+      - name: Prepare code signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+              Write-Warning 'Secrets are not available to this pull request (fork?): building an UNSIGNED installer.'
+              'SIGN_ENABLED=0' | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+              exit 0
+            }
+            throw 'The WINDOWS_CERTIFICATE secret is missing or empty.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          try {
+            # the secret must be the BASE64 text of the .pfx file; tolerate line breaks / spaces
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String(($env:WINDOWS_CERTIFICATE -replace '\s', '')))
+          } catch { throw "WINDOWS_CERTIFICATE is not valid base64 of a .pfx file: $($_.Exception.Message)" }
+          try {
+            $c = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:WINDOWS_CERTIFICATE_PASSWORD)
+          } catch { throw "Could not open the .pfx (wrong WINDOWS_CERTIFICATE_PASSWORD, or the secret is not a PFX): $($_.Exception.Message)" }
+          "Certificate subject : $($c.Subject)"
+          "Certificate issuer  : $($c.Issuer)"
+          "Valid until         : $($c.NotAfter)"
+          "Has private key     : $($c.HasPrivateKey)"
+          if (-not $c.HasPrivateKey) { throw 'The .pfx has no private key, it cannot sign.' }
+          if ($c.NotAfter -lt (Get-Date)) { throw "The certificate expired on $($c.NotAfter)." }
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -like '*\x64\*' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { throw 'signtool.exe (Windows SDK) not found on this runner.' }
+          "signtool            : $($st.FullName)"
+          "CERT_PATH=$pfx" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SIGNTOOL=$($st.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          'SIGN_ENABLED=1' | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Rust tests on Windows (hardware detection APIs, planner, backend)
         run: cargo test -p mg-core -- --test-threads=1
@@ -123,6 +162,19 @@ jobs:
 
       - name: Build installer helper (hardware probe + planner)
         run: cargo build --release -p mg-probe
+
+      - name: Sign the app and helper executables
+        if: env.SIGN_ENABLED == '1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in 'target\release\medgemma-offline.exe', 'target\release\mg-probe.exe') {
+            ./tools/sign.ps1 (Resolve-Path $f).Path
+            if ($LASTEXITCODE -ne 0) { throw "signing $f failed" }
+            $s = Get-AuthenticodeSignature $f
+            "{0}: {1} (signer: {2})" -f $f, $s.Status, $s.SignerCertificate.Subject
+            if (-not $s.SignerCertificate) { throw "$f has no signature after signing" }
+          }
 
       - name: Fetch + trim llama.cpp engines (CPU + Vulkan GPU), pinned tag
         shell: pwsh
@@ -177,18 +229,39 @@ jobs:
             if ((Get-Item staging\MicrosoftEdgeWebView2RuntimeInstallerX64.exe).Length -lt 100MB) { throw 'WebView2 standalone download looks wrong' }
           }
 
-      - name: Build installer with Inno Setup
+      - name: Build installer with Inno Setup (signed installer + signed uninstaller)
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
           $ver = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0-ci' }
           $defs = @("/DAppVersion=$ver")
           if ('${{ matrix.bundle_webview2 }}' -eq 'true') { $defs += '/DBundleWebView2' }
+          if ($env:SIGN_ENABLED -eq '1') {
+            # Inno replaces $f with the quoted file name; tools/sign.ps1 does the actual signtool call.
+            # The workspace path has no spaces, so no inner quotes are needed (ISCC's /S parsing dislikes them).
+            $signScript = (Resolve-Path tools\sign.ps1).Path
+            $defs += '/DSign'
+            $defs += ('/Smgsign=powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $signScript + ' $f')
+          }
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @defs installer\medgemma.iss
           if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
           "APP_VER=$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          Get-ChildItem out | ForEach-Object { "{0}  {1:N1} MB  sha256={2}" -f $_.Name, ($_.Length / 1MB), (Get-FileHash $_.FullName).Hash }
+          Get-ChildItem out\*.exe | ForEach-Object { "{0}  {1:N1} MB  sha256={2}" -f $_.Name, ($_.Length / 1MB), (Get-FileHash $_.FullName).Hash }
           Get-ChildItem out\*.exe | ForEach-Object { (Get-FileHash $_.FullName).Hash + "  " + $_.Name } | Set-Content out\SHA256SUMS.txt
+
+      - name: Verify the installer is Authenticode-signed
+        if: env.SIGN_ENABLED == '1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in Get-ChildItem out\*.exe) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            "{0}: status={1} signer=[{2}] timestamp={3}" -f $f.Name, $s.Status, $s.SignerCertificate.Subject, ($(if ($s.TimeStamperCertificate) { 'yes' } else { 'NO' }))
+            # A self-signed / private-CA certificate reports 'UnknownError' (chain not trusted on this runner) - still signed.
+            if (-not $s.SignerCertificate -or $s.Status -in 'NotSigned','HashMismatch','Incompatible','NotSupportedFileFormat') {
+              throw "$($f.Name) is NOT correctly signed (status $($s.Status))"
+            }
+          }
 
       - name: Build an OLDER version (0.0.1) of the bundled installer for the upgrade test
         if: matrix.bundle_webview2
@@ -293,6 +366,12 @@ jobs:
             ${{ runner.temp }}/e2e-work/saved-report.pdf
             ${{ runner.temp }}/old.log
             ${{ runner.temp }}/upgrade.log
+
+      - name: Remove the signing certificate from the runner
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:CERT_PATH) { Remove-Item $env:CERT_PATH -Force -ErrorAction SilentlyContinue }
 
       - name: Attach to GitHub release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
