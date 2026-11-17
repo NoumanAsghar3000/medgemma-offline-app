@@ -6,7 +6,7 @@
 // The app is started with MG_TEST_PICK_FOLDER / MG_TEST_SAVE_PATH so the two NATIVE dialogs (folder picker, Save)
 // - which a headless test cannot click - are replaced by those paths. Everything else is the real UI code path.
 import { spawn, execSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync } from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import WebSocket from "ws";
@@ -22,22 +22,36 @@ async function pdfText(file) {   // real text extraction (pdf-lib compresses con
 const { APP_EXE, GOOD_MODELS, WORK_DIR } = process.env;
 if (!APP_EXE || !GOOD_MODELS || !WORK_DIR) { console.error("APP_EXE, GOOD_MODELS, WORK_DIR required"); process.exit(2); }
 mkdirSync(WORK_DIR, { recursive: true });
-const PORT = 9333, PDF_OUT = path.join(WORK_DIR, "saved-report.pdf");
+const PORT = 9333, PDF_OUT = path.join(WORK_DIR, "saved-report.pdf"), APP_LOG = path.join(WORK_DIR, "app.log");
 const results = [];
 const check = (name, ok, detail = "", required = true) => { results.push({ name, ok: !!ok, detail: String(detail).slice(0, 300), required }); console.log(`${ok ? "PASS" : (required ? "FAIL" : "SOFT-FAIL")}  ${name}${detail ? "  - " + String(detail).slice(0, 200) : ""}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---- start the app with a debuggable WebView2 and a FAKE camera
+// ---- start the app with a debuggable WebView2 and a FAKE camera.
+// A FRESH WebView2 user-data folder is used on purpose: WebView2 refuses to start (and the window never appears) when another
+// instance already owns the same user-data folder with different browser arguments, e.g. a leftover from an earlier test step.
 const env = { ...process.env, MG_TEST_PICK_FOLDER: GOOD_MODELS, MG_TEST_SAVE_PATH: PDF_OUT,
+  WEBVIEW2_USER_DATA_FOLDER: path.join(WORK_DIR, "webview2-data"),
   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT} --use-fake-device-for-media-stream --use-fake-ui-for-media-stream` };
-const app = spawn(APP_EXE, [], { env, stdio: "ignore", detached: false });
-let appExited = false; app.on("exit", () => (appExited = true));
+const logFd = openSync(APP_LOG, "w");   // keep the app's stdout/stderr: it was thrown away before, which made failures undiagnosable
+const app = spawn(APP_EXE, [], { env, stdio: ["ignore", logFd, logFd], detached: false });
+let appExited = false, appExitCode = null; app.on("exit", (c) => { appExited = true; appExitCode = c; }); app.on("error", (e) => console.log("spawn error: " + e.message));
+
+function diagnostics() {
+  const run = (c) => { try { return execSync(c, { encoding: "utf8", timeout: 20000 }); } catch (e) { return String(e.stdout || e.message); } };
+  console.log("--- DIAG app exited: " + appExited + " code: " + appExitCode);
+  console.log("--- DIAG related processes:\n" + run('tasklist | findstr /I "medgemma llama msedgewebview2 setup"'));
+  console.log("--- DIAG port " + PORT + ":\n" + run("netstat -ano | findstr :" + PORT));
+  console.log("--- DIAG app output:\n" + (existsSync(APP_LOG) ? readFileSync(APP_LOG, "utf8").slice(-3000) : "(none)"));
+  console.log("--- DIAG webview2 data folder:\n" + run('dir "' + path.join(WORK_DIR, "webview2-data") + '" /b'));
+}
 
 async function targetWs() {
   for (let i = 0; i < 120 && !appExited; i++) {
     try { const l = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json(); const t = l.find((x) => x.type === "page" && x.webSocketDebuggerUrl); if (t) return t.webSocketDebuggerUrl; } catch { /* not up yet */ }
     await sleep(1000);
   }
+  diagnostics();
   throw new Error("WebView2 debugging endpoint never came up (app exited: " + appExited + ")");
 }
 let ws, nextId = 1; const pending = new Map();
