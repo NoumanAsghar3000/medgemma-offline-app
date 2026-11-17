@@ -1,5 +1,6 @@
 ; MedGemma Offline - Inno Setup 6.3+ script. Built in CI (see .github/workflows/build.yml).
 ; Build flags:  /DAppVersion=1.0.0   /DBundleWebView2   (ships the offline WebView2 runtime installer)
+;               /DSign + /Smgsign=<command>   (Authenticode-signs the installer AND the uninstaller; used in CI)
 #ifndef AppVersion
   #define AppVersion "1.0.0"
 #endif
@@ -10,6 +11,7 @@ AppName=MedGemma Offline
 AppVersion={#AppVersion}
 AppPublisher=Nouman
 AppVerName=MedGemma Offline {#AppVersion}
+AppCopyright=Copyright (C) Nouman
 UninstallDisplayName=MedGemma Offline
 DefaultGroupName=MedGemma Offline
 UsePreviousAppDir=yes
@@ -21,6 +23,8 @@ DefaultDirName={sd}\MedGemmaOffline
 DisableProgramGroupPage=yes
 DisableDirPage=no
 PrivilegesRequired=admin
+MinVersion=10.0
+ShowLanguageDialog=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 #ifdef FastCompress
@@ -38,6 +42,11 @@ OutputDir=..\out
 OutputBaseFilename=MedGemmaOffline-Setup-{#AppVersion}-with-WebView2
 #else
 OutputBaseFilename=MedGemmaOffline-Setup-{#AppVersion}
+#endif
+#ifdef Sign
+; the command behind 'mgsign' is passed on the ISCC command line (/Smgsign=...) by the CI workflow
+SignTool=mgsign
+SignedUninstaller=yes
 #endif
 
 [Tasks]
