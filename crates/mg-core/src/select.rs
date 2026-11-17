@@ -1,8 +1,12 @@
 //! Model discovery + "largest MedGemma multimodal variant that fits" selection.
 //!
-//! Priority (strict):
-//!   1. MedGemma 27B *multimodal* (GGUF + mmproj). Largest quantization whose
-//!      (weights + mmproj + runtime overhead) <= free RAM - 1 GiB.
+//! Detection is by CONTENT: the GGUF header (architecture, layer count, embedding width, projector width, file type)
+//! decides which family (27B / 4B) and which precision (8-bit / 16-bit ...) a file is. File names and folders are only a
+//! hint for files whose header says nothing, so your own fine-tunes work whatever they are called and whatever size they have.
+//!
+//! Priority (strict), each family independent of the other:
+//!   1. MedGemma 27B *multimodal* (GGUF + its own mmproj). Within a family 8-bit comes first, then 16-bit, then the
+//!      other quantizations (largest first); a variant is used when its WORST-CASE speed is usable.
 //!   2. MedGemma 4B multimodal (same rule).
 //!   3. MedGemma 4B text-only (only if no 4B mmproj exists; flagged in the plan).
 use crate::{gguf, plan, GIB};
@@ -111,9 +115,10 @@ pub fn scan(dir: &Path) -> std::io::Result<Inventory> {
     Ok(inv)
 }
 
-/// Read the real headers and (1) fill in family/quant when the name does not say, (2) detect unusable files and bad pairings.
+/// Read the real headers and (1) let the CONTENT decide family / precision (names only fill in what the header cannot say),
+/// (2) detect unusable files and bad pairings.
 fn is_split_part(name: &str) -> bool {
-    // llama.cpp split naming: <name>-00001-of-00002.gguf
+    // llama.cpp split naming: <n>-00001-of-00002.gguf
     let l = name.to_ascii_lowercase();
     l.find("-of-").map(|i| i >= 6 && l.as_bytes()[i - 5..i].iter().all(|b| b.is_ascii_digit()) && l[i + 4..].chars().take(5).all(|c| c.is_ascii_digit())).unwrap_or(false)
 }
@@ -127,8 +132,18 @@ pub fn enrich(inv: &mut Inventory) {
         match gguf::read_info(&f.path) {
             Ok(i) => {
                 if i.arch == "clip" { f.is_mmproj = true; }
-                if f.quant == "unknown" { if let Some(q) = i.quant_name() { f.quant = q.to_string(); } }
-                if f.family.is_none() { f.family = i.family_guess(); }
+                // CONTENT WINS over the file name / folder. 8-bit vs 16-bit: the header's file type is authoritative for the exact
+                // tags (F32 / F16 / BF16 / Q8_0); other quantization tags keep the name's more specific label (e.g. Q8_K_XL).
+                if let Some(q) = i.quant_name() {
+                    if f.quant == "unknown" || matches!(q, "F32" | "F16" | "BF16" | "Q8_0") { f.quant = q.to_string(); }
+                }
+                // family: real Gemma-3 geometry (62 layers / 5376 wide = 27B, 34 layers / 2560 wide = 4B; projector width for mmproj files)
+                if let Some(g) = i.family_guess() {
+                    if let Some(claimed) = f.family {
+                        if claimed != g { f.warnings.push(format!("the file name or folder says {} but the file content is {}: the content is used", claimed.label(), g.label())); }
+                    }
+                    f.family = Some(g);
+                }
                 f.info = Some(i);
             }
             Err(e) => { if f.size > 1 << 20 { f.problem = Some(format!("cannot read the GGUF header: {e}")); } }   // tiny/fake files: ignore
@@ -148,7 +163,7 @@ pub fn enrich(inv: &mut Inventory) {
         let mm = best_mmproj(&snapshot, fam).and_then(|m| m.info.as_ref().map(|i| (m.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), i.clone())));
         let c = gguf::check_pair(fam, &info, mm.as_ref().map(|(n, i)| (n.as_str(), i)));
         if !c.errors.is_empty() { f.problem = Some(c.errors.join("; ")); }
-        f.warnings = c.warnings;
+        f.warnings.extend(c.warnings);
         let fname = f.path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         if let Some(n) = &info.name { if !n.to_ascii_lowercase().contains("medgemma") && !fname.contains("medgemma") {
             f.warnings.push(format!("the model is named '{n}', not MedGemma: accepted (fine for your own fine-tune), but it is a general Gemma 3 model if you did not train it"));
@@ -225,6 +240,12 @@ fn build_plan(fam: Family, m: &GgufFile, mm: Option<&GgufFile>, mc: &Machine, fo
     }
 }
 
+/// Preference inside one family: 8-bit first (near-lossless at half the memory and twice the speed of 16-bit), then 16-bit,
+/// then 32-bit, then every other quantization. Equal rank: the larger file first.
+fn precision_rank(quant: &str) -> u8 {
+    match quant { "Q8_0" | "Q8_K_XL" => 0, "F16" | "BF16" => 1, "F32" => 2, _ => 3 }
+}
+
 /// Every installed variant with its placement/speed estimate (for the installer text and the in-app selector).
 pub fn variants(inv: &Inventory, mc: &Machine) -> Vec<Plan> {
     let mut out = vec![];
@@ -232,15 +253,16 @@ pub fn variants(inv: &Inventory, mc: &Machine) -> Vec<Plan> {
         let mm = best_mmproj(inv, fam);
         if mm.is_none() && fam == Family::G27 { continue; }
         let mut ms: Vec<&GgufFile> = inv.files.iter().filter(|f| !f.is_mmproj && f.family == Some(fam) && !f.text_only && f.problem.is_none()).collect();
-        ms.sort_by(|a, b| b.size.cmp(&a.size));
+        ms.sort_by(|a, b| precision_rank(&a.quant).cmp(&precision_rank(&b.quant)).then(b.size.cmp(&a.size)));
         for m in ms { out.push(build_plan(fam, m, mm, mc, false)); }
     }
     out
 }
 
 /// Automatic policy:
-///   1. MedGemma 27B multimodal: the LARGEST quantization (8-bit first) whose WORST-CASE estimated speed is >= MIN_TPS.
-///   2. else MedGemma 4B, same rule (the only fallback).
+///   1. MedGemma 27B multimodal: the preferred precision (8-bit, then 16-bit, then the other quantizations) whose WORST-CASE
+///      estimated speed is >= MIN_TPS.
+///   2. else MedGemma 4B, same rule (the only fallback). Each family is independent: a folder with only one of them works.
 /// The worst case (a dense model scanned cyclically through a too-small page cache gets no hits) is used so that
 /// the automatic choice never gambles on optimistic cache behaviour; a user can still force any variant
 /// (`plan_for`) and sees the best-worst range. Returns Err(TooSlow) when nothing qualifies.
@@ -250,8 +272,12 @@ pub fn choose(inv: &Inventory, mc: &Machine) -> Result<Plan, SelectError> {
         let has27 = inv.files.iter().any(|f| !f.is_mmproj && f.family == Some(Family::G27) && !f.text_only);
         let problems: Vec<String> = inv.files.iter().filter_map(|f| f.problem.as_ref().map(|p| format!("{}: {}", f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), p))).collect();
         if !problems.is_empty() { return Err(SelectError::NoModels(format!("The model files in this folder cannot be used - {}", problems.join(" | ")))); }
+        let projectors: Vec<String> = inv.files.iter().filter(|f| f.is_mmproj && f.problem.is_none()).map(|f| format!("{} is a {} projector",
+            f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            f.family.map(|x| x.label().trim_start_matches("MedGemma ").to_string()).unwrap_or_else(|| "unidentified".into()))).collect();
         return Err(SelectError::NoModels(if has27 {
-            "MedGemma 27B weights found but its mmproj (vision) file is missing - 27B is skipped because it would not be multimodal, and no 4B model is present.".into()
+            format!("MedGemma 27B weights found but no vision projector (mmproj) that matches 27B was found{} - 27B is skipped because it would not be multimodal, and no 4B model is present.",
+                if projectors.is_empty() { String::new() } else { format!(" (found: {})", projectors.join("; ")) })
         } else { "No MedGemma .gguf model files were found in this folder.".into() }));
     }
     let best = all.iter().map(|p| p.placement.tps_best).fold(0.0, f64::max);   // reported in the error only
@@ -317,18 +343,21 @@ mod tests {
         // the two same-named mmproj files were paired by FOLDER, and both validated by header geometry
         assert_eq!(choose(&inv, &m(60.0, Compute::Cpu, 0.0, NVME)).unwrap().family, Family::G27);
     }
-    #[test] fn a_mismatched_pair_is_rejected_precisely_and_selection_falls_back_to_4b() {
-        // user copied the 4B mmproj into the 27b folder
+    #[test] fn a_mismatched_pair_is_reported_precisely_and_selection_falls_back_to_4b() {
+        // user copied the 4B mmproj into the 27b folder: the CONTENT says it is a 4B projector, so 27B has no projector of its own
         let d = layout("bad", &[("models/27b/medgemma-27b-it-Q8_0.gguf", "hdr-27b-q8.gguf"), ("models/27b/mmproj-F16.gguf", "hdr-clip-2560.gguf"),
                                 ("models/4b/medgemma-4b-it-Q4_K_M.gguf", "hdr-4b-q4km.gguf"), ("models/4b/mmproj-F16.gguf", "hdr-clip-2560.gguf")]);
         let inv = scan(&d.join("models")).unwrap();
-        let bad = inv.files.iter().find(|f| f.family == Some(Family::G27) && !f.is_mmproj).unwrap();
-        assert!(bad.problem.as_ref().unwrap().contains("2560") && bad.problem.as_ref().unwrap().contains("5376"), "{:?}", bad.problem);
-        assert_eq!(choose(&inv, &m(60.0, Compute::Cpu, 0.0, NVME)).unwrap().family, Family::G4);
-        // only the broken 27B present -> a precise error, not a crash
+        let wrong = inv.files.iter().find(|f| f.is_mmproj && f.path.starts_with(d.join("models").join("27b"))).unwrap();
+        assert_eq!(wrong.family, Some(Family::G4));
+        assert!(wrong.warnings.iter().any(|w| w.contains("content")), "{:?}", wrong.warnings);
+        let p = choose(&inv, &m(60.0, Compute::Cpu, 0.0, NVME)).unwrap();
+        assert_eq!(p.family, Family::G4);
+        assert!(variants(&inv, &m(60.0, Compute::Cpu, 0.0, NVME)).iter().all(|v| v.family == Family::G4));
+        // only the 27B with the wrong projector present -> a precise error, not a crash
         let only = layout("bad2", &[("models/27b/medgemma-27b-it-Q8_0.gguf", "hdr-27b-q8.gguf"), ("models/27b/mmproj-F16.gguf", "hdr-clip-2560.gguf")]);
         let e = choose(&scan(&only.join("models")).unwrap(), &m(60.0, Compute::Cpu, 0.0, NVME)).unwrap_err().to_string();
-        assert!(e.contains("cannot be used") && e.contains("embedding size 2560"), "{e}");
+        assert!(e.contains("27B") && e.contains("4B projector"), "{e}");
     }
     #[test] fn a_27b_file_in_the_4b_folder_and_a_plain_gemma3_are_caught() {
         let d = layout("misplaced", &[("models/4b/medgemma-4b-it-Q8_0.gguf", "hdr-27b-q8.gguf"), ("models/4b/mmproj-F16.gguf", "hdr-clip-2560.gguf")]);
@@ -410,6 +439,25 @@ mod tests {
     #[test] fn big_ram_picks_27b_8bit() {
         let p = choose(&inv(), &m(40.0, Compute::Cpu, 0.0, NVME)).unwrap();
         assert_eq!((p.family, p.quant.as_str()), (Family::G27, "Q8_0")); assert_eq!(p.placement.streamed_bytes, 0);
+    }
+    #[test] fn eight_bit_is_preferred_over_sixteen_bit_in_each_family_and_16bit_alone_still_works() {
+        let mut i = inv(); i.files.push(f("medgemma-27b-it-F16.gguf", 54.0)); i.files.push(f("medgemma-4b-it-F16.gguf", 7.8));
+        let big = m(120.0, Compute::Cpu, 0.0, NVME);
+        let vs = variants(&i, &big);
+        assert_eq!(vs.iter().find(|p| p.family == Family::G27).unwrap().quant, "Q8_0");
+        assert_eq!(vs.iter().find(|p| p.family == Family::G4).unwrap().quant, "Q8_0");
+        assert_eq!(choose(&i, &big).unwrap().quant, "Q8_0");
+        assert!(vs.iter().any(|p| p.quant == "F16" && p.family == Family::G27), "16-bit stays selectable");
+        let only16 = Inventory { files: vec![f("mine-27b-F16.gguf", 54.0), f("mmproj-mine-27b-F16.gguf", 0.9)] };
+        let p = choose(&only16, &big).unwrap(); assert_eq!((p.family, p.quant.as_str()), (Family::G27, "F16"));
+    }
+    #[test] fn a_wrong_file_name_never_overrides_the_header() {
+        let d = layout("swapped", &[("mix/medgemma-4b-it-Q8_0.gguf", "hdr-27b-q8.gguf"), ("mix/mmproj-medgemma-4b-it-F16.gguf", "hdr-clip-5376.gguf")]);
+        let inv = scan(&d.join("mix")).unwrap();
+        let model = inv.files.iter().find(|f| !f.is_mmproj).unwrap();
+        assert_eq!(model.family, Some(Family::G27), "62 layers = 27B whatever the name claims");
+        assert!(model.warnings.iter().any(|w| w.contains("content")), "{:?}", model.warnings);
+        assert_eq!(choose(&inv, &m(80.0, Compute::Cpu, 0.0, NVME)).unwrap().family, Family::G27);
     }
     #[test] fn medium_ram_steps_down_to_the_largest_quant_that_is_still_usable() {
         // 21 GB budget: Q8/Q5 exceed RAM -> worst case re-reads everything each token (< MIN_TPS) -> Q4_K_M stays resident
