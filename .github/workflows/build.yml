@@ -196,13 +196,21 @@ jobs:
           Copy-Item target\release\mg-probe.exe staging\ ; New-Item -ItemType Directory -Force staging\app | Out-Null
           Copy-Item target\release\medgemma-offline.exe staging\app\
           .\staging\mg-probe.exe hw
-          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\models" | Out-Null
-          foreach ($n in @(@('medgemma-4b-it-Q8_0.gguf',4.1),@('mmproj-medgemma-4b-it-F16.gguf',0.85))) {
-            $f = [System.IO.File]::Create("$env:RUNNER_TEMP\models\$($n[0])"); $f.SetLength([int64]($n[1]*1GB)); $f.Close()
+          # The planner validates REAL GGUF headers (architecture, layer count, projector width), so zero-filled fake files
+          # are rejected as 'bad magic'. Start from the genuine 4B + matching-projector header files that the Rust tests
+          # already use, then pad them (sparse, no real disk use) to realistic model sizes.
+          $m = "$env:RUNNER_TEMP\models"
+          New-Item -ItemType Directory -Force $m | Out-Null
+          $hdr = 'crates\mg-core\tests\data'
+          Copy-Item "$hdr\hdr-4b-q4km.gguf"   "$m\medgemma-4b-it-Q4_K_M.gguf" -Force
+          Copy-Item "$hdr\hdr-clip-2560.gguf" "$m\mmproj-medgemma-4b-it-F16.gguf" -Force
+          foreach ($n in @(@('medgemma-4b-it-Q4_K_M.gguf', 2.5), @('mmproj-medgemma-4b-it-F16.gguf', 0.85))) {
+            $f = [System.IO.File]::Open("$m\$($n[0])", [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
+            $f.SetLength([int64]($n[1] * 1GB)); $f.Close()
           }
-          .\staging\mg-probe.exe plan --dir "$env:RUNNER_TEMP\models" --compute cpu
-          .\staging\mg-probe.exe plan --dir "$env:RUNNER_TEMP\models" --compute cpu --out "$env:RUNNER_TEMP\plan.txt"
-          if (-not (Select-String -Path "$env:RUNNER_TEMP\plan.txt" -Pattern '^status=ok')) { throw 'planner did not return status=ok' }
+          .\staging\mg-probe.exe plan --dir $m --compute cpu
+          .\staging\mg-probe.exe plan --dir $m --compute cpu --out "$env:RUNNER_TEMP\plan.txt"
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\plan.txt" -Pattern '^status=ok')) { Get-Content "$env:RUNNER_TEMP\plan.txt"; throw 'planner did not return status=ok' }
 
       - name: SMOKE TEST on real Windows - staged llama-server.exe serves a Gemma-3-architecture model
         shell: pwsh
