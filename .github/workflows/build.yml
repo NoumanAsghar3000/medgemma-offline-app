@@ -350,7 +350,10 @@ jobs:
           '{ "compute": "cpu", "model_dir": "C:\\does-not-exist-medgemma" }' | Set-Content -Encoding utf8 "$env:APP_DIR\install.json"
           Remove-Item "$env:APPDATA\com.nouman.medgemma.offline" -Recurse -Force -ErrorAction SilentlyContinue
           $env:APP_EXE = "$env:APP_DIR\medgemma-offline.exe"; $env:GOOD_MODELS = $good; $env:WORK_DIR = "$env:RUNNER_TEMP\e2e-work"
-          node tools/e2e_webview.mjs
+          New-Item -ItemType Directory -Force $env:WORK_DIR | Out-Null
+          # keep the whole console output (incl. the '--- DIAG' block the test prints on failure) as a downloadable file
+          node tools/e2e_webview.mjs 2>&1 | Tee-Object -FilePath "$env:WORK_DIR\e2e-console.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: UNINSTALL - silent, then verify ZERO leftovers (files, shortcuts, registry, user data, processes)
         if: always() && matrix.bundle_webview2 && env.APP_DIR != ''
@@ -362,7 +365,7 @@ jobs:
           Start-Sleep 4
           ./tools/verify_install.ps1 -Phase uninstalled -AppDir $env:APP_DIR
 
-      - name: Upload test evidence (wizard screenshots + state log, e2e results + saved PDF, setup logs)
+      - name: Upload test evidence (wizard screenshots + state log, e2e console + app log + results + saved PDF, setup logs)
         if: always() && matrix.bundle_webview2
         uses: actions/upload-artifact@v4
         with:
@@ -370,6 +373,8 @@ jobs:
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/wizard-evidence/**
+            ${{ runner.temp }}/e2e-work/e2e-console.txt
+            ${{ runner.temp }}/e2e-work/app.log
             ${{ runner.temp }}/e2e-work/e2e-results.json
             ${{ runner.temp }}/e2e-work/saved-report.pdf
             ${{ runner.temp }}/old.log
