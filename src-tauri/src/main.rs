@@ -150,7 +150,7 @@ fn pick_model_folder(app: AppHandle) -> Result<bool, String> {
     };
     let inv = mg_core::select::scan(&dir).map_err(|e| format!("Cannot read that folder: {e}"))?;
     if !inv.files.iter().any(|f| !f.is_mmproj && f.family.is_some()) {
-        return Err("No MedGemma .gguf model files were found in that folder (looking for names containing 27b or 4b).".into());
+        return Err("No usable MedGemma model files were found in that folder. The app looks at the content of every .gguf file (27B or 4B Gemma 3 weights, 8-bit or 16-bit, plus the matching mmproj), not at the file names.".into());
     }
     let mut cfg = load_cfg(&app);
     cfg.model_dir = dir.display().to_string();
@@ -248,6 +248,22 @@ fn save_report(app: AppHandle, filename: String, data_b64: String) -> Result<Opt
     Ok(Some(path.display().to_string()))
 }
 
+/// The main window is created here (tauri.conf.json has `"create": false`) with exactly the configuration it would otherwise get.
+/// The ONLY reason it is created in code: on Windows, Tauri/wry hand WebView2 their own browser arguments through the API, which the
+/// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS environment variable cannot reliably extend. The CI-only hook below (never set for users) lets the
+/// end-to-end test add `--remote-debugging-port` and fake-camera flags through the API.
+fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = app.config().app.windows.first().cloned().ok_or("no window is configured in tauri.conf.json")?;
+    let builder = tauri::WebviewWindowBuilder::from_config(app, &cfg)?;
+    #[cfg(windows)]
+    let builder = match std::env::var("MG_TEST_BROWSER_ARGS") {
+        Ok(a) if !a.trim().is_empty() => builder.additional_browser_args(&a),
+        _ => builder,
+    };
+    builder.build()?;
+    Ok(())
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -257,7 +273,7 @@ fn main() {
             chat_cancel: AtomicBool::new(false), busy: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
         })
-        .setup(|app| { bootstrap(app.handle().clone()); start_idle_watcher(app.handle().clone()); Ok(()) })
+        .setup(|app| { create_main_window(app)?; bootstrap(app.handle().clone()); start_idle_watcher(app.handle().clone()); Ok(()) })
         .invoke_handler(tauri::generate_handler![get_status, pick_model_folder, retry, list_variants, choose_variant, set_memory_mode, chat_stream, chat_cancel, save_report])
         .build(tauri::generate_context!())
         .expect("failed to build app");

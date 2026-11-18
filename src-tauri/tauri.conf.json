@@ -12,7 +12,7 @@
   "app": {
     "withGlobalTauri": false,
     "windows": [
-      { "label": "main", "title": "MedGemma Offline", "width": 1100, "height": 780, "minWidth": 720, "minHeight": 520 }
+      { "label": "main", "title": "MedGemma Offline", "width": 1100, "height": 780, "minWidth": 720, "minHeight": 520, "create": false }
     ],
     "security": {
       "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
