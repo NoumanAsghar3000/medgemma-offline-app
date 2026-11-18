@@ -2,6 +2,7 @@ import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { processFile, type Att } from "./attachments";
+import { cameraErrorMessage, openCameraStream, stopStream, waitForFrame } from "./camera";
 import { buildMessages, streamChat, type Turn } from "./chat";
 import { md } from "./md";
 import { buildReportPdf, isStructured, parseSections, type ReportFile } from "./report";
@@ -142,20 +143,26 @@ window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => { e.preventDefault(); addFiles([...(e.dataTransfer?.files ?? [])]); });
 
 let stream: MediaStream | null = null;
+let camSeq = 0;                                   // bumped on every open/close so a late permission answer cannot revive a closed dialog
+function closeCameraStream() { stopStream(stream); stream = null; }
 async function openCamera() {
+  closeCameraStream(); const seq = ++camSeq;
+  const shot = $<HTMLButtonElement>("cam-shot"); shot.disabled = true;
   $("cam").hidden = false; $("cam-err").textContent = "";
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1600 } }, audio: false });
-    $<HTMLVideoElement>("video").srcObject = stream;
-  } catch (e) {
-    $("cam-err").textContent = "Camera unavailable: " + ((e as Error).name === "NotAllowedError"
-      ? "permission denied. Enable it in Windows Settings → Privacy & security → Camera (allow desktop apps)."
-      : "no camera found or it is in use by another app.");
-  }
+    const s = await openCameraStream();          // constraint ladder: rear camera preferred, then any camera
+    if (seq !== camSeq) { stopStream(s); return; }
+    stream = s;
+    s.getVideoTracks().forEach((t) => t.addEventListener("ended", () => { if (stream === s) { $("cam-err").textContent = "The camera was disconnected."; shot.disabled = true; } }));
+    const v = $<HTMLVideoElement>("video"); v.srcObject = s;
+    if (await waitForFrame(v, 15000)) { if (seq === camSeq) shot.disabled = false; }
+    else if (seq === camSeq) $("cam-err").textContent = "The camera started but is not delivering images. Close other apps that use the camera and try again.";
+  } catch (e) { if (seq === camSeq) $("cam-err").textContent = cameraErrorMessage(e); }
 }
-function closeCamera() { stream?.getTracks().forEach((t) => t.stop()); stream = null; $("cam").hidden = true; }
+function closeCamera() { camSeq++; closeCameraStream(); $<HTMLVideoElement>("video").srcObject = null; $("cam").hidden = true; }
 $("m-cam").onclick = openCamera;
 $("cam-cancel").onclick = closeCamera;
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("cam").hidden) closeCamera(); });
 $("cam-shot").onclick = () => {
   const v = $<HTMLVideoElement>("video"); if (!v.videoWidth) return;
   const c = document.createElement("canvas"); c.width = v.videoWidth; c.height = v.videoHeight;
