@@ -47,13 +47,19 @@ jobs:
           echo "MG_REAL_LLAMA_DIR=$(dirname "$(find "$RUNNER_TEMP/llama" -name llama-server -type f | head -1)")" >> "$GITHUB_ENV"
           echo "MG_TINY_GGUF=$RUNNER_TEMP/tiny.gguf" >> "$GITHUB_ENV"
 
-      - name: Rust unit + integration tests (planner, selection, supervisor, REAL llama-server end-to-end)
+      # includes tests/selfmodels.rs: self-trained 27B/4B (8-bit + 16-bit) detected by GGUF content, independence of the two
+      # families, 8-bit preference, and the GPU planning path through the real prepare_with (sparse multi-GB files, Linux only)
+      - name: Rust unit + integration tests (planner, selection, self-trained 27B/4B, GPU planning, supervisor, REAL llama-server end-to-end)
         run: cargo test -p mg-core -- --test-threads=1 --nocapture
 
-      - name: TypeScript tests (report parsing, CSV summary, real PDF generation)
+      # npm test = tsx --test src/*.test.ts: report parsing, CSV summary, real PDF generation, camera helpers (src/camera.test.ts)
+      - name: TypeScript tests (report parsing, CSV summary, real PDF generation, camera helpers)
         run: |
           npm ci
           npm test
+
+      - name: DOCX attachment support (dependency-free DOCX generator, read back by mammoth)
+        run: node --test tools/docx.test.mjs
 
       - name: Build UI and run the OFFLINE AUDIT (no CDN / fonts / external hosts)
         run: |
@@ -152,7 +158,7 @@ jobs:
           "SIGNTOOL=$($st.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           'SIGN_ENABLED=1' | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-      - name: Rust tests on Windows (hardware detection APIs, planner, backend)
+      - name: Rust tests on Windows (hardware detection APIs, planner, self-trained model detection, backend)
         run: cargo test -p mg-core -- --test-threads=1
 
       - name: Build UI + native shell (Tauri, exe only - Inno Setup does the installing)
@@ -348,13 +354,40 @@ jobs:
           if ($j.compute -ne 'cpu' -or -not $j.model_dir) { throw 'install.json content wrong' }
           "APP_DIR=$app" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-      # Not release-blocking: this drives the installed app through a WebView2 remote-debugging port. On GitHub's runner the app and
-      # WebView2 start but the debug port never opens (see e2e-console.txt / app.log in the test-evidence artifact). The signed installers
-      # are already built, verified and uploaded above, so a failure here is reported as a warning instead of turning the build red.
+      # CPU and GPU are independent choices. The CPU installs above never needed a GPU (this runner has none). Here the GPU choice is
+      # made silently: with no GPU it must be REFUSED without touching the existing CPU installation; with a GPU it must install the
+      # Vulkan engine next to the CPU engine.
+      - name: INSTALLER - CPU and GPU choices are independent (a GPU choice is only accepted when a GPU exists; CPU never needs one)
+        if: matrix.bundle_webview2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $new = (Get-ChildItem out\MedGemmaOffline-Setup-*-with-WebView2.exe | Select-Object -First 1).FullName
+          $app = $env:APP_DIR
+          $hw = @{}
+          (& "$app\tools\mg-probe.exe" hw) | ForEach-Object { if ($_ -match '^(\w+)=(.*)$') { $hw[$Matches[1]] = $Matches[2] } }
+          "runner hardware: gpu_ok=$($hw['gpu_ok']) gpu_name='$($hw['gpu_name'])' ram_ok=$($hw['ram_ok'])"
+          if ($hw['ram_ok'] -ne '1') { throw 'the runner reports less than 4 GB RAM' }
+          $gpuArgs = "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=`"$app`"","/COMPUTE=gpu","/MODELDIR=`"$env:RUNNER_TEMP\models`"","/LOG=`"$env:RUNNER_TEMP\gpu-choice.log`""
+          $p = Start-Process $new -Wait -PassThru -ArgumentList $gpuArgs
+          if ($hw['gpu_ok'] -eq '1') {
+            if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\gpu-choice.log" -Tail 40; throw 'GPU install failed although a GPU exists' }
+            ./tools/verify_install.ps1 -Phase installed -AppDir $app -Version $env:APP_VER -DesktopIcon -Compute gpu
+          } else {
+            "No GPU on this runner: the GPU choice must be refused (exit code $($p.ExitCode)) and the CPU installation must stay untouched"
+            if ($p.ExitCode -eq 0) { throw 'a GPU install was accepted although no GPU exists' }
+            if (Test-Path "$app\backend\vulkan") { throw 'a refused GPU install left the Vulkan engine behind' }
+            $j = Get-Content "$app\install.json" -Raw | ConvertFrom-Json
+            if ($j.compute -ne 'cpu') { throw 'a refused GPU install changed the existing CPU installation' }
+            ./tools/verify_install.ps1 -Phase installed -AppDir $app -Version $env:APP_VER -DesktopIcon -Compute cpu
+          }
+
+      # BLOCKING (no continue-on-error): drives the installed app through the REAL WebView2: missing-folder dialog + re-link, DOCX / CSV /
+      # TXT / PDF / PNG attachments, camera capture and its failure modes, structured answer, native-save PDF. The browser arguments for the
+      # debug port and the fake camera are injected through the API (MG_TEST_BROWSER_ARGS), see src-tauri/src/main.rs.
       - name: E2E in REAL WebView2 - launch installed app with a MISSING model folder, re-link, attach, camera, chat, save PDF
         if: matrix.bundle_webview2
         shell: pwsh
-        continue-on-error: true
         run: |
           $good = "$env:RUNNER_TEMP\e2e-models"
           if (-not (Test-Path "$good\4b")) { New-Item -ItemType Directory -Force "$good\4b" | Out-Null; python tools/make_tiny_gemma3.py "$good\4b\medgemma-4b-it-F32.gguf" }
@@ -391,6 +424,7 @@ jobs:
             ${{ runner.temp }}/e2e-work/saved-report.pdf
             ${{ runner.temp }}/old.log
             ${{ runner.temp }}/upgrade.log
+            ${{ runner.temp }}/gpu-choice.log
 
       - name: Remove the signing certificate from the runner
         if: always()
