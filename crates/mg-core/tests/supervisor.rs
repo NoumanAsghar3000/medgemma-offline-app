@@ -69,18 +69,20 @@ fn run(name: &str, free_gb: u64, reject: bool, bw: Bandwidth) -> (String, String
     http::post_sse(l.port, "secret", r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}]}]}"#, &AtomicBool::new(false), |e| ev.push(e)).expect("chat");
     assert!(http::post_sse(l.port, "WRONG", "{}", &AtomicBool::new(false), |_| {}).unwrap_err().contains("401"));
     backend::kill(&mut l.child);
-    (plan.quant.clone(), fs::read_to_string(&args_out).unwrap(), ev)
+    // The fixtures are ONE tiny F32 header renamed to fake quantization levels. The header (content) decides the precision label,
+    // so the label would read "F32" for every file; what these tests prove is WHICH FILE is chosen, so they compare file names.
+    (plan.model.file_name().unwrap().to_string_lossy().to_string(), fs::read_to_string(&args_out).unwrap(), ev)
 }
 
 #[test] fn picks_27b_launches_with_tuning_flags_and_streams() {
-    let (quant, args, ev) = run("a", 20, false, NVME);   // 20 GB free -> budget 19 -> Q4_K_M (16+1+1.5=18.5) fits
-    assert_eq!(quant, "Q4_K_M");
+    let (file, args, ev) = run("a", 20, false, NVME);   // 20 GB free -> budget 19 -> Q4_K_M (16+1+1.5=18.5) fits
+    assert_eq!(file, "medgemma-27b-it-Q4_K_M.gguf");
     for f in ["-np 1", "--mmproj", "--no-webui", "--no-warmup", "--cache-ram 0", "--offline", "--host 127.0.0.1", "-ngl 0"] { assert!(args.contains(f), "{f} missing in {args}"); }
     assert!(!args.contains("--no-mmap") && !args.contains("--mlock"));
     assert_eq!(ev.len(), 5); assert!(ev[1].contains("img=True")); assert_eq!(ev[4], "[DONE]");
 }
 #[test] fn smaller_free_ram_steps_down_the_quant() {
-    assert_eq!(run("b", 17, false, USB).0, "Q3_K_M");   // slow drive: Q4 would stream 2.5 GB/token (0.08 tok/s) -> Q3 stays resident
+    assert_eq!(run("b", 17, false, USB).0, "medgemma-27b-it-Q3_K_M.gguf");   // slow drive: Q4 would stream 2.5 GB/token (0.08 tok/s) -> Q3 stays resident
 }
 #[test] fn retries_without_optional_flags_when_engine_rejects_them() {
     let (_, args, ev) = run("c", 20, true, NVME);
