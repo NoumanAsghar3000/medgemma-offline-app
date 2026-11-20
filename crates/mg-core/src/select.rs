@@ -132,6 +132,12 @@ pub fn enrich(inv: &mut Inventory) {
         match gguf::read_info(&f.path) {
             Ok(i) => {
                 if i.arch == "clip" { f.is_mmproj = true; }
+                // A file name containing the word "text" marks MedGemma's text-only release, but it is only a name: when the model's OWN
+                // metadata name does not say "text", the file is the user's own (multimodal-capable) fine-tune and is NOT dropped.
+                if f.text_only { if let Some(n) = &i.name { if !has_word(&n.to_ascii_lowercase(), "text") {
+                    f.text_only = false;
+                    f.warnings.push(format!("the file name contains 'text' but the model is named '{n}': treated as a normal (multimodal-capable) model"));
+                } } }
                 // CONTENT WINS over the file name / folder. 8-bit vs 16-bit: the header's file type is authoritative for the exact
                 // tags (F32 / F16 / BF16 / Q8_0); other quantization tags keep the name's more specific label (e.g. Q8_K_XL).
                 if let Some(q) = i.quant_name() {
@@ -278,6 +284,9 @@ pub fn choose(inv: &Inventory, mc: &Machine) -> Result<Plan, SelectError> {
         return Err(SelectError::NoModels(if has27 {
             format!("MedGemma 27B weights found but no vision projector (mmproj) that matches 27B was found{} - 27B is skipped because it would not be multimodal, and no 4B model is present.",
                 if projectors.is_empty() { String::new() } else { format!(" (found: {})", projectors.join("; ")) })
+        } else if inv.files.iter().any(|f| !f.is_mmproj && f.text_only) {
+            let names: Vec<String> = inv.files.iter().filter(|f| !f.is_mmproj && f.text_only).map(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect();
+            format!("Only text-only model files were found ({}): they cannot read images, so they are not used. If this is your own multimodal fine-tune, rename the file so its name does not contain the word 'text'.", names.join(", "))
         } else { "No MedGemma .gguf model files were found in this folder.".into() }));
     }
     let best = all.iter().map(|p| p.placement.tps_best).fold(0.0, f64::max);   // reported in the error only

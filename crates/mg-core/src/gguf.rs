@@ -19,6 +19,8 @@ pub struct GgufInfo {
     pub file_type: Option<u32>,
     pub projector_type: Option<String>,
     pub projection_dim: Option<u64>,
+    /// ggml tensor type of the largest 2-D weight tensor (read from the tensor table, not from a file name): the real precision.
+    pub weight_type: Option<u32>,
 }
 
 /// llama.cpp `llama_ftype` values -> the quant tags used in file names.
@@ -30,8 +32,16 @@ pub fn ftype_name(t: u32) -> Option<&'static str> {
     })
 }
 
+/// ggml tensor type ids -> the precisions that matter for 8-bit / 16-bit detection (everything else: None, the file type decides).
+pub fn weight_type_name(t: u32) -> Option<&'static str> {
+    Some(match t { 0 => "F32", 1 => "F16", 8 => "Q8_0", 30 => "BF16", _ => return None })
+}
+
 impl GgufInfo {
-    pub fn quant_name(&self) -> Option<&'static str> { self.file_type.and_then(ftype_name) }
+    /// Precision: the header's `general.file_type` first; when a converter left it out, the type of the largest weight tensor.
+    pub fn quant_name(&self) -> Option<&'static str> {
+        self.file_type.and_then(ftype_name).or_else(|| self.weight_type.and_then(weight_type_name))
+    }
     /// Gemma 3 geometry: 27B = 62 layers / 5376 wide, 4B = 34 layers / 2560 wide.
     pub fn family_guess(&self) -> Option<Family> {
         let by_dim = |d: u64| match d { 5376 => Some(Family::G27), 2560 => Some(Family::G4), _ => None };
@@ -83,7 +93,7 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
     if &rd::<4>(&mut r)? != b"GGUF" { return Err("not a GGUF file (bad magic)".into()); }
     let mut info = GgufInfo { version: u32_(&mut r)?, ..Default::default() };
     if !(2..=3).contains(&info.version) { return Err(format!("unsupported GGUF version {}", info.version)); }
-    let _tensors = u64_(&mut r)?; let kvs = u64_(&mut r)?;
+    let tensors = u64_(&mut r)?; let kvs = u64_(&mut r)?;
     if kvs > 100_000 { return Err("implausible metadata size".into()); }
     for _ in 0..kvs {
         let key = string(&mut r, 1 << 16)?; let t = u32_(&mut r)?;
@@ -106,7 +116,24 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
         }
     }
     if info.arch.is_empty() { return Err("GGUF has no general.architecture".into()); }
+    // The tensor table follows the metadata. A problem in it (header-only fixtures, truncated downloads) never fails detection:
+    // the metadata alone already identified the file, the table only refines the precision.
+    info.weight_type = read_weight_type(&mut r, tensors).ok().flatten();
     Ok(info)
+}
+
+/// ggml type of the 2-D tensor with the most elements (the token embedding / big FFN matrices: what the file is really made of).
+fn read_weight_type(r: &mut impl Read, count: u64) -> Result<Option<u32>, String> {
+    if count == 0 || count > 100_000 { return Ok(None); }
+    let mut best: Option<(u64, u32)> = None;
+    for _ in 0..count {
+        let _name = string(r, 1 << 16)?;
+        let nd = u32_(r)?; if nd == 0 || nd > 8 { return Err("implausible tensor dimension count".into()); }
+        let mut elems: u64 = 1; for _ in 0..nd { elems = elems.saturating_mul(u64_(r)?); }
+        let ty = u32_(r)?; let _off = u64_(r)?;
+        if nd >= 2 && best.map(|(e, _)| elems > e).unwrap_or(true) { best = Some((elems, ty)); }
+    }
+    Ok(best.map(|(_, t)| t))
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -188,6 +215,15 @@ mod tests {
         m.block_count = Some(62); assert!(check_pair(Family::G4, &m, None).errors[0].contains("27B"));
         m.block_count = Some(2); let c = check_pair(Family::G4, &m, None); assert!(c.errors.is_empty() && c.warnings.len() == 1);
         m.arch = "llama".into(); assert!(check_pair(Family::G4, &m, None).errors[0].contains("not a Gemma 3"));
+    }
+    #[test] fn precision_falls_back_to_the_tensor_table_and_never_breaks_detection() {
+        let f16 = GgufInfo { weight_type: Some(1), ..Default::default() }; let q8 = GgufInfo { weight_type: Some(8), ..Default::default() };
+        let bf = GgufInfo { weight_type: Some(30), ..Default::default() }; let q4 = GgufInfo { weight_type: Some(12), ..Default::default() };
+        assert_eq!((f16.quant_name(), q8.quant_name(), bf.quant_name(), q4.quant_name()), (Some("F16"), Some("Q8_0"), Some("BF16"), None));
+        // file_type, when present, wins
+        assert_eq!(GgufInfo { file_type: Some(7), weight_type: Some(1), ..Default::default() }.quant_name(), Some("Q8_0"));
+        // the committed header-only fixtures have a tensor table that is missing / truncated: still read fine
+        for n in ["hdr-27b-q8.gguf", "hdr-4b-q4km.gguf", "hdr-clip-5376.gguf", "tiny-gemma3.gguf"] { assert!(read_info(&data(n)).is_ok(), "{n}"); }
     }
     #[test] fn family_guess_from_real_geometry() {
         let g = |b, e| GgufInfo { block_count: Some(b), embedding_length: Some(e), ..Default::default() };

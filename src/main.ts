@@ -2,7 +2,7 @@ import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { processFile, type Att } from "./attachments";
-import { cameraErrorMessage, openCameraStream, stopStream, waitForFrame } from "./camera";
+import { CameraSession } from "./camera";
 import { buildMessages, streamChat, type Turn } from "./chat";
 import { md } from "./md";
 import { buildReportPdf, isStructured, parseSections, type ReportFile } from "./report";
@@ -142,32 +142,22 @@ document.addEventListener("paste", (e) => { const f = [...(e.clipboardData?.file
 window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => { e.preventDefault(); addFiles([...(e.dataTransfer?.files ?? [])]); });
 
-let stream: MediaStream | null = null;
-let camSeq = 0;                                   // bumped on every open/close so a late permission answer cannot revive a closed dialog
-function closeCameraStream() { stopStream(stream); stream = null; }
-async function openCamera() {
-  closeCameraStream(); const seq = ++camSeq;
-  const shot = $<HTMLButtonElement>("cam-shot"); shot.disabled = true;
-  $("cam").hidden = false; $("cam-err").textContent = "";
-  try {
-    const s = await openCameraStream();          // constraint ladder: rear camera preferred, then any camera
-    if (seq !== camSeq) { stopStream(s); return; }
-    stream = s;
-    s.getVideoTracks().forEach((t) => t.addEventListener("ended", () => { if (stream === s) { $("cam-err").textContent = "The camera was disconnected."; shot.disabled = true; } }));
-    const v = $<HTMLVideoElement>("video"); v.srcObject = s;
-    if (await waitForFrame(v, 15000)) { if (seq === camSeq) shot.disabled = false; }
-    else if (seq === camSeq) $("cam-err").textContent = "The camera started but is not delivering images. Close other apps that use the camera and try again.";
-  } catch (e) { if (seq === camSeq) $("cam-err").textContent = cameraErrorMessage(e); }
-}
-function closeCamera() { camSeq++; closeCameraStream(); $<HTMLVideoElement>("video").srcObject = null; $("cam").hidden = true; }
-$("m-cam").onclick = openCamera;
-$("cam-cancel").onclick = closeCamera;
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("cam").hidden) closeCamera(); });
+const cam = new CameraSession({
+  show: () => { $("cam").hidden = false; },
+  hide: () => { $("cam").hidden = true; },
+  setError: (m) => { $("cam-err").textContent = m; },
+  setCaptureEnabled: (on) => { $<HTMLButtonElement>("cam-shot").disabled = !on; },
+  showStream: (s) => { $<HTMLVideoElement>("video").srcObject = s; },
+  get video() { return $<HTMLVideoElement>("video"); },
+});
+$("m-cam").onclick = () => { void cam.open(); };       // constraint ladder, readiness gating, disconnect handling: see src/camera.ts
+$("cam-cancel").onclick = () => cam.close();
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && cam.visible) cam.close(); });
 $("cam-shot").onclick = () => {
   const v = $<HTMLVideoElement>("video"); if (!v.videoWidth) return;
   const c = document.createElement("canvas"); c.width = v.videoWidth; c.height = v.videoHeight;
   c.getContext("2d")!.drawImage(v, 0, 0);
-  c.toBlob((b) => { if (b) addFiles([new File([b], `camera-${new Date().toISOString().replace(/[:.]/g, "-")}.jpg`, { type: "image/jpeg" })]); closeCamera(); }, "image/jpeg", 0.92);
+  c.toBlob((b) => { if (b) addFiles([new File([b], `camera-${new Date().toISOString().replace(/[:.]/g, "-")}.jpg`, { type: "image/jpeg" })]); cam.close(); }, "image/jpeg", 0.92);
 };
 
 /* ---------------- chat ---------------- */

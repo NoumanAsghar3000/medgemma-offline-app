@@ -11,10 +11,10 @@ import { spawn, execSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync } from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
-import WebSocket from "ws";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import { makeDocx } from "./make_docx.mjs";
+import { createCdp, sleep } from "./cdp.mjs";
 
 async function pdfText(file) {   // real text extraction (pdf-lib compresses content streams, so grepping bytes proves nothing)
   const doc = await pdfjs.getDocument({ data: new Uint8Array(readFileSync(file)), verbosity: 0 }).promise;
@@ -28,7 +28,6 @@ mkdirSync(WORK_DIR, { recursive: true });
 const PORT = 9333, PDF_OUT = path.join(WORK_DIR, "saved-report.pdf"), APP_LOG = path.join(WORK_DIR, "app.log");
 const results = [];
 const check = (name, ok, detail = "", required = true) => { results.push({ name, ok: !!ok, detail: String(detail).slice(0, 300), required }); console.log(`${ok ? "PASS" : (required ? "FAIL" : "SOFT-FAIL")}  ${name}${detail ? "  - " + String(detail).slice(0, 200) : ""}`); };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- start the app with a debuggable WebView2 and a FAKE camera.
 // A FRESH WebView2 user-data folder is used on purpose: WebView2 refuses to start (and the window never appears) when another
@@ -56,31 +55,14 @@ function diagnostics() {
 
 async function targetWs() {
   for (let i = 0; i < 120 && !appExited; i++) {
-    try { const l = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json(); const t = l.find((x) => x.type === "page" && x.webSocketDebuggerUrl); if (t) return t.webSocketDebuggerUrl; } catch { /* not up yet */ }
+    try { const l = await (await fetch(`http://127.0.0.1:${PORT}/json`, { signal: AbortSignal.timeout(3000) })).json(); const t = l.find((x) => x.type === "page" && x.webSocketDebuggerUrl); if (t) return t.webSocketDebuggerUrl; } catch { /* not up yet */ }
     await sleep(1000);
   }
   diagnostics();
   throw new Error("WebView2 debugging endpoint never came up (app exited: " + appExited + ")");
 }
-let ws, nextId = 1; const pending = new Map();
-function send(method, params = {}) { return new Promise((res, rej) => { const id = nextId++; pending.set(id, { res, rej }); ws.send(JSON.stringify({ id, method, params })); }); }
-async function ev(expr) {
-  const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
-  if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
-  return r.result.value;
-}
-async function waitFor(expr, ms, label) {
-  const t0 = Date.now(); let last;
-  while (Date.now() - t0 < ms) { try { last = await ev(expr); if (last) return last; } catch (e) { last = String(e); } await sleep(700); }
-  throw new Error(`timeout waiting for ${label || expr} (last: ${String(last).slice(0, 120)})`);
-}
-const click = (sel) => ev(`document.querySelector(${JSON.stringify(sel)}).click(), true`);
-const text = (sel) => ev(`(document.querySelector(${JSON.stringify(sel)})||{}).innerText||''`);
-async function setFiles(files) {
-  const { root } = await send("DOM.getDocument"); const { nodeId } = await send("DOM.querySelector", { nodeId: root.nodeId, selector: "#file" });
-  await send("DOM.setFileInputFiles", { files, nodeId });
-  await ev(`document.getElementById('file').dispatchEvent(new Event('change',{bubbles:true})), true`);
-}
+const cdp = createCdp();
+const { send, ev, waitFor, click, text, setFiles } = cdp;
 
 function png(w, h) {   // tiny valid RGB PNG (no deps)
   const raw = Buffer.alloc((w * 3 + 1) * h); for (let y = 0; y < h; y++) { raw[y * (w * 3 + 1)] = 0; for (let x = 0; x < w; x++) { const o = y * (w * 3 + 1) + 1 + x * 3; raw[o] = (x * 4) & 255; raw[o + 1] = (y * 4) & 255; raw[o + 2] = 128; } }
@@ -91,10 +73,22 @@ function png(w, h) {   // tiny valid RGB PNG (no deps)
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
 }
 
+function cleanup() {
+  cdp.close();
+  try { execSync("taskkill /F /T /IM llama-server.exe", { stdio: "ignore" }); } catch {}
+  try { app.kill(); execSync(`taskkill /F /T /PID ${app.pid}`, { stdio: "ignore" }); } catch {}
+}
+function writeResults() { writeFileSync(path.join(WORK_DIR, "e2e-results.json"), JSON.stringify(results, null, 2)); }
+// the whole run must finish: a hang must produce diagnostics and a failure, never a stuck job
+const WATCHDOG_MS = 25 * 60 * 1000;
+const watchdog = setTimeout(() => {
+  check("e2e finished within 25 minutes", false, "watchdog fired");
+  diagnostics(); cleanup(); writeResults(); process.exit(1);
+}, WATCHDOG_MS);
+
 try {
   const url = await targetWs();
-  ws = new WebSocket(url); await new Promise((r, j) => { ws.on("open", r); ws.on("error", j); });
-  ws.on("message", (m) => { const d = JSON.parse(m); if (d.id && pending.has(d.id)) { const p = pending.get(d.id); pending.delete(d.id); d.error ? p.rej(new Error(d.error.message)) : p.res(d.result); } });
+  await cdp.connect(url);
   await send("Runtime.enable"); await send("DOM.enable"); await send("Page.enable");
   check("real WebView2 UI loaded and scripted over DevTools", true, url);
 
@@ -133,9 +127,12 @@ try {
   check("PDF was read (text extracted) and image decoded to a thumbnail", await ev(`!!document.querySelector('#chips img') && !/could not|unsupported/i.test(document.getElementById('chips').innerText)`));
 
   // 4) camera (fake device) - REQUIRED: getUserMedia -> live preview -> capture -> attached as an image chip
+  const videoInputs = await ev(`navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'videoinput').length)`).catch(() => 0);
+  check("the page sees the (fake) camera device", videoInputs >= 1, `${videoInputs} video input(s)`, false);
   await click("#plus"); await click("#m-cam");
   await waitFor(`!document.getElementById('cam').hidden`, 5000, "camera dialog");
-  await waitFor(`document.getElementById('video').videoWidth>0 && !document.getElementById('cam-shot').disabled`, 25000, "camera frames + capture button enabled");
+  // fail fast with the app's own message (permission / no camera / in use) instead of timing out; Capture is clicked only when it is ENABLED
+  await waitFor(`document.getElementById('video').videoWidth>0 && !document.getElementById('cam-shot').disabled`, 25000, "camera frames + capture button enabled", `document.getElementById('cam-err').innerText.trim()`);
   await click("#cam-shot");
   await waitFor(`document.getElementById('chips').innerText.includes('camera-')`, 20000, "camera chip");
   check("camera: getUserMedia in WebView2 -> capture -> attached as image", true);
@@ -152,7 +149,7 @@ try {
   }
   await ev(`(()=>{ const md=navigator.mediaDevices; md.getUserMedia = (c) => (c.video && c.video.facingMode) ? Promise.reject(new DOMException('x','OverconstrainedError')) : window.__gum(c); return true })()`);
   await click("#plus"); await click("#m-cam");
-  await waitFor(`!document.getElementById('cam-shot').disabled`, 25000, "camera after the rear-camera constraint failed");
+  await waitFor(`!document.getElementById('cam-shot').disabled`, 25000, "camera after the rear-camera constraint failed", `document.getElementById('cam-err').innerText.trim()`);
   check("camera: falls back to any camera when the rear-camera constraint cannot be met", true);
   await click("#cam-cancel");
   await ev(`(()=>{ navigator.mediaDevices.getUserMedia = window.__gum; return true })()`);
@@ -199,11 +196,10 @@ try {
 } catch (e) {
   check("e2e run", false, e.stack || e.message);
 } finally {
-  try { ws?.close(); } catch {}
-  try { execSync("taskkill /F /T /IM llama-server.exe", { stdio: "ignore" }); } catch {}
-  try { app.kill(); execSync(`taskkill /F /T /PID ${app.pid}`, { stdio: "ignore" }); } catch {}
+  clearTimeout(watchdog);
+  cleanup();
 }
-writeFileSync(path.join(WORK_DIR, "e2e-results.json"), JSON.stringify(results, null, 2));
+writeResults();
 const failed = results.filter((r) => !r.ok && r.required);
 console.log(`\n${results.filter((r) => r.ok).length}/${results.length} checks passed; required failures: ${failed.length}`);
 process.exit(failed.length ? 1 : 0);

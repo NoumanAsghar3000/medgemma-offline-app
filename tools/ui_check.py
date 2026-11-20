@@ -77,6 +77,7 @@ try:
         wait(lambda: bool(js("return document.getElementById('video').videoWidth > 0 && !document.getElementById('cam-shot').disabled")), 20, "camera frames + capture button enabled")
         shot("03-camera"); drv.find_element(By.ID, "cam-shot").click()
         wait(lambda: "camera-" in drv.find_element(By.ID, "chips").text, 15, "camera chip"); check("camera: capture attaches a photo chip", True)
+        wait(lambda: drv.find_element(By.ID, "cam").get_attribute("hidden") is not None, 5, "camera dialog closes"); check("camera: dialog closes after capture", True)
     except AssertionError as e:
         check("camera: capture attaches a photo chip", False, e); js("document.getElementById('cam').hidden=true")
     shot("03b-attachments")

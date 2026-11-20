@@ -28,15 +28,23 @@ const BV: Item = ("beta-vision.gguf", Kind::Projector { dim: 2560 }, 0.85);
 
 enum V<'a> { S(&'a str), U(u32) }
 
-fn write_gguf(path: &Path, kvs: &[(&str, V)]) {
+fn write_gguf(path: &Path, kvs: &[(&str, V)]) { write_gguf_t(path, kvs, &[]); }
+
+/// `tensors`: (name, dims, ggml type id). Written as a real GGUF tensor table after the metadata.
+fn write_gguf_t(path: &Path, kvs: &[(&str, V)], tensors: &[(&str, &[u64], u32)]) {
     let mut b: Vec<u8> = b"GGUF".to_vec();
-    b.extend(3u32.to_le_bytes()); b.extend(0u64.to_le_bytes()); b.extend((kvs.len() as u64).to_le_bytes());
+    b.extend(3u32.to_le_bytes()); b.extend((tensors.len() as u64).to_le_bytes()); b.extend((kvs.len() as u64).to_le_bytes());
     for (k, v) in kvs {
         b.extend((k.len() as u64).to_le_bytes()); b.extend(k.as_bytes());
         match v {
             V::S(s) => { b.extend(8u32.to_le_bytes()); b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); }
             V::U(n) => { b.extend(4u32.to_le_bytes()); b.extend(n.to_le_bytes()); }
         }
+    }
+    for (name, dims, ty) in tensors {
+        b.extend((name.len() as u64).to_le_bytes()); b.extend(name.as_bytes());
+        b.extend((dims.len() as u32).to_le_bytes()); for d in *dims { b.extend(d.to_le_bytes()); }
+        b.extend(ty.to_le_bytes()); b.extend(0u64.to_le_bytes());
     }
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, b).unwrap();
@@ -174,6 +182,68 @@ fn files_that_are_not_gemma3_are_refused_precisely() {
     write_gguf(&d2.join("qwen-vision.gguf"), &[("general.architecture", V::S("clip")), ("clip.projector_type", V::S("qwen2vl")), ("clip.vision.projection_dim", V::U(3584))]);
     let e = choose(&scan(&d2).unwrap(), &cpu(120.0)).unwrap_err().to_string();
     assert!(e.contains("qwen2vl"), "{e}");
+}
+
+/// A converter (convert_hf_to_gguf --outtype f16 / q8_0 / bf16, or a custom export) may leave `general.file_type` out. The tensor table
+/// still says what the weights are, so 8-bit and 16-bit are told apart by CONTENT, whatever the file is called.
+#[test]
+fn precision_is_read_from_the_tensor_table_when_the_header_has_no_file_type() {
+    let d = tmp("tensors");
+    let kv = |layers: u32, width: u32| vec![("general.architecture", V::S("gemma3")), ("general.name", V::S("medgemma-selftrained")),
+                                             ("gemma3.block_count", V::U(layers)), ("gemma3.embedding_length", V::U(width))];
+    // (file, layers, width, type of the big matrices): 1 = F16, 8 = Q8_0, 30 = BF16
+    let cases: [(&str, u32, u32, u32, &str); 4] = [
+        ("run7-sixteen.gguf", 62, 5376, 1, "F16"), ("run7-eight.gguf", 62, 5376, 8, "Q8_0"),
+        ("run9-small-sixteen.gguf", 34, 2560, 1, "F16"), ("run9-small-brain.gguf", 34, 2560, 30, "BF16"),
+    ];
+    for (name, layers, width, ty, _) in cases {
+        // 1-D norm weights are F32 (type 0) in every real file; they must not decide the precision
+        write_gguf_t(&d.join(name), &kv(layers, width), &[("output_norm.weight", &[width as u64], 0), ("blk.0.ffn_up.weight", &[width as u64, 4 * width as u64], ty), ("token_embd.weight", &[width as u64, 262144], ty)]);
+    }
+    let inv = scan(&d).unwrap();
+    for (name, layers, _, _, want) in cases {
+        let f = inv.files.iter().find(|f| f.path.ends_with(name)).unwrap();
+        assert_eq!(f.quant, want, "{name}");
+        assert_eq!(f.family, Some(if layers == 62 { Family::G27 } else { Family::G4 }), "{name}");
+        assert!(f.problem.is_none(), "{name}: {:?}", f.problem);
+    }
+}
+
+#[test]
+fn a_damaged_or_missing_tensor_table_never_hides_a_model() {
+    let d = tmp("badtensors");
+    // tensor_count says 5 but the file ends right after the metadata (header-only export)
+    let mut b: Vec<u8> = b"GGUF".to_vec();
+    b.extend(3u32.to_le_bytes()); b.extend(5u64.to_le_bytes()); b.extend(4u64.to_le_bytes());
+    for (k, v) in [("general.architecture", V::S("gemma3")), ("general.name", V::S("medgemma-selftrained")), ("gemma3.block_count", V::U(62)), ("gemma3.embedding_length", V::U(5376))] {
+        b.extend((k.len() as u64).to_le_bytes()); b.extend(k.as_bytes());
+        match v { V::S(s) => { b.extend(8u32.to_le_bytes()); b.extend((s.len() as u64).to_le_bytes()); b.extend(s.as_bytes()); } V::U(n) => { b.extend(4u32.to_le_bytes()); b.extend(n.to_le_bytes()); } }
+    }
+    fs::write(d.join("export.gguf"), b).unwrap();
+    let inv = scan(&d).unwrap();
+    let f = &inv.files[0];
+    assert_eq!((f.family, f.problem.is_none(), f.quant.as_str()), (Some(Family::G27), true, "unknown"));
+}
+
+/// The word "text" in a FILE NAME marks MedGemma's text-only release, but a fine-tune may be called anything: the model's own metadata
+/// name decides when it is there.
+#[test]
+fn a_file_name_with_the_word_text_does_not_hide_your_own_multimodal_fine_tune() {
+    let build = |dir: &str, general_name: &str| {
+        let d = tmp(dir);
+        for (n, k) in [("mammo-text-reports-27b-final.gguf", Kind::Model { layers: 62, width: 5376, ftype: 7 }), ("vision-final.gguf", Kind::Projector { dim: 5376 })] { write_item(&d, n, k); }
+        write_gguf(&d.join("mammo-text-reports-27b-final.gguf"), &[("general.architecture", V::S("gemma3")), ("general.name", V::S(general_name)),
+            ("gemma3.block_count", V::U(62)), ("gemma3.embedding_length", V::U(5376)), ("general.file_type", V::U(7))]);
+        scan(&d).unwrap()
+    };
+    // own fine-tune: metadata name has no "text" -> used
+    let own = build("txt_own", "medgemma-mammo-ft");
+    let p = choose(&own, &cpu(120.0)).unwrap();
+    assert_eq!(p.family, Family::G27); assert!(p.note.contains("'text'"), "{}", p.note);
+    // the real text-only release names itself "text" in its metadata -> still excluded, with a precise message
+    let text_only = build("txt_real", "medgemma-27b-text-it");
+    let e = choose(&text_only, &cpu(120.0)).unwrap_err().to_string();
+    assert!(e.contains("text-only") && e.contains("rename"), "{e}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
