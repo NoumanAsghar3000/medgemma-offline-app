@@ -198,8 +198,10 @@ fn precision_is_read_from_the_tensor_table_when_the_header_has_no_file_type() {
     ];
     for (name, layers, width, ty, _) in cases {
         // 1-D norm weights are F32 (type 0) in every real file; they must not decide the precision
-        write_gguf_t(&d.join(name), &kv(layers, width), &[("output_norm.weight", &[width as u64], 0), ("blk.0.ffn_up.weight", &[width as u64, 4 * width as u64], ty), ("token_embd.weight", &[width as u64, 262144], ty)]);
+        // small tensors (the file is "complete" once it is padded to the size the table implies)
+        write_gguf_t(&d.join(name), &kv(layers, width), &[("output_norm.weight", &[256], 0), ("blk.0.ffn_up.weight", &[256, 512], ty), ("token_embd.weight", &[256, 1024], ty)]);
     }
+    for (name, ..) in cases { fs::OpenOptions::new().write(true).open(d.join(name)).unwrap().set_len(2 << 20).unwrap(); }   // tensor data present
     let inv = scan(&d).unwrap();
     for (name, layers, _, _, want) in cases {
         let f = inv.files.iter().find(|f| f.path.ends_with(name)).unwrap();
@@ -244,6 +246,143 @@ fn a_file_name_with_the_word_text_does_not_hide_your_own_multimodal_fine_tune() 
     let text_only = build("txt_real", "medgemma-27b-text-it");
     let e = choose(&text_only, &cpu(120.0)).unwrap_err().to_string();
     assert!(e.contains("text-only") && e.contains("rename"), "{e}");
+}
+
+/// The tensor table implies a minimum file size. A model copied or downloaded only partly is refused with a precise message; the same
+/// file, complete, is accepted.
+#[test]
+fn an_incomplete_copy_is_refused_precisely_and_the_complete_file_is_accepted() {
+    let d = tmp("incomplete");
+    let kv = vec![("general.architecture", V::S("gemma3")), ("general.name", V::S("medgemma-selftrained")), ("gemma3.block_count", V::U(34)), ("gemma3.embedding_length", V::U(2560)), ("general.file_type", V::U(1))];
+    write_gguf_t(&d.join("beta-full.gguf"), &kv, &[("blk.0.ffn_up.weight", &[4096, 4096], 1)]);      // 4096*4096*2 = 32 MiB of F16 data
+    write_item(&d, "beta-vision.gguf", Kind::Projector { dim: 2560 });
+    let inv = scan(&d).unwrap();
+    let f = inv.files.iter().find(|f| f.path.ends_with("beta-full.gguf")).unwrap();
+    assert!(f.problem.as_deref().unwrap_or("").contains("INCOMPLETE"), "{:?}", f.problem);
+    let e = choose(&inv, &cpu(60.0)).unwrap_err().to_string();
+    assert!(e.contains("cannot be used") && e.contains("INCOMPLETE") && e.contains("copy it again"), "{e}");
+    fs::OpenOptions::new().write(true).open(d.join("beta-full.gguf")).unwrap().set_len(40 << 20).unwrap();   // now the data is there
+    let ok = scan(&d).unwrap();
+    assert!(ok.files.iter().all(|f| f.problem.is_none()), "{:?}", ok.files.iter().map(|f| &f.problem).collect::<Vec<_>>());
+    assert_eq!(choose(&ok, &cpu(60.0)).unwrap().family, Family::G4);
+}
+
+fn raw_header(version: u32, tensors: u64, kvs: u64, body: &[u8]) -> Vec<u8> {
+    let mut b: Vec<u8> = b"GGUF".to_vec();
+    b.extend(version.to_le_bytes()); b.extend(tensors.to_le_bytes()); b.extend(kvs.to_le_bytes()); b.extend(body);
+    b
+}
+fn kv_key(k: &str) -> Vec<u8> { let mut b = (k.len() as u64).to_le_bytes().to_vec(); b.extend(k.as_bytes()); b }
+
+/// Runs `f` on a thread and fails (instead of hanging the whole test run) when it does not finish: a corrupt header must never loop.
+fn finishes_within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(f()); });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).expect("reading a corrupt header hung or panicked")
+}
+
+#[test]
+fn damaged_headers_give_clean_errors_never_a_panic_or_a_hang() {
+    use mg_core::gguf::read_info;
+    let d = tmp("corrupt");
+    let w = |name: &str, bytes: &[u8]| { let p = d.join(name); fs::write(&p, bytes).unwrap(); p };
+    // 1) arrays whose declared length is absurd / would overflow / would seek backwards
+    let mut huge_arr = kv_key("tokenizer.ggml.tokens"); huge_arr.extend(9u32.to_le_bytes()); huge_arr.extend(4u32.to_le_bytes()); huge_arr.extend(u64::MAX.to_le_bytes());   // u32 array, 2^64-1 entries
+    let mut str_arr = kv_key("tokenizer.ggml.tokens"); str_arr.extend(9u32.to_le_bytes()); str_arr.extend(8u32.to_le_bytes()); str_arr.extend(1_000_000u64.to_le_bytes());
+    str_arr.extend((1u64 << 63).to_le_bytes());                                                                                                                    // first string "length" 2^63 (negative as i64)
+    let mut long_str = kv_key("general.description"); long_str.extend(8u32.to_le_bytes()); long_str.extend((1u64 << 40).to_le_bytes());                          // string far past the end of the file
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("huge-array.gguf", raw_header(3, 0, 1, &huge_arr)),
+        ("string-array.gguf", raw_header(3, 0, 1, &str_arr)),
+        ("long-string.gguf", raw_header(3, 0, 1, &long_str)),
+        ("kv-count.gguf", raw_header(3, 0, 1 << 40, b"")),
+        ("version-0.gguf", raw_header(0, 0, 0, b"")),
+        ("version-99.gguf", raw_header(99, 0, 0, b"")),
+        ("empty.gguf", vec![]),
+        ("magic-only.gguf", b"GGUF".to_vec()),
+        ("not-gguf.gguf", b"PK\x03\x04 this is a zip, not a model".to_vec()),
+    ];
+    for (name, bytes) in &cases {
+        let p = w(name, bytes);
+        let r = finishes_within(20, move || read_info(&p));
+        assert!(r.is_err(), "{name} must be rejected, got {r:?}");
+    }
+    // big-endian files are named as such
+    let be = w("be.gguf", &[b"GGUF".as_slice(), &3u32.to_be_bytes(), &[0u8; 16]].concat());
+    assert!(read_info(&be).unwrap_err().contains("big-endian"), "{:?}", read_info(&be));
+    // oversized tensor counts / dimension counts are ignored (the metadata still identifies the file), not followed
+    let mut meta = kv_key("general.architecture"); meta.extend(8u32.to_le_bytes()); meta.extend(6u64.to_le_bytes()); meta.extend(b"gemma3");
+    let p = w("tensors-huge.gguf", &raw_header(3, u64::MAX, 1, &meta));
+    let i = finishes_within(20, move || read_info(&p)).unwrap(); assert_eq!((i.arch.as_str(), i.weight_type, i.expected_min_size), ("gemma3", None, None));
+}
+
+/// Truncating a valid header at EVERY byte and flipping/ruining bytes at pseudo-random places: always Ok or Err, never a panic or a hang.
+#[test]
+fn every_truncation_and_thousands_of_mutations_are_survived() {
+    use mg_core::gguf::read_info;
+    let d = tmp("fuzz");
+    let kv = vec![("general.architecture", V::S("gemma3")), ("general.name", V::S("medgemma-selftrained")), ("gemma3.block_count", V::U(62)), ("gemma3.embedding_length", V::U(5376)), ("general.file_type", V::U(7))];
+    write_gguf_t(&d.join("base.gguf"), &kv, &[("output_norm.weight", &[5376], 0), ("blk.0.ffn_up.weight", &[5376, 21504], 8), ("token_embd.weight", &[5376, 262144], 8)]);
+    let base = fs::read(d.join("base.gguf")).unwrap();
+    let probe = d.join("probe.gguf");
+    let outcome = finishes_within(120, move || {
+        let (mut ok, mut err) = (0u32, 0u32);
+        let mut run = |bytes: &[u8]| { fs::write(&probe, bytes).unwrap(); if read_info(&probe).is_ok() { ok += 1 } else { err += 1 } };
+        for cut in 0..=base.len() { run(&base[..cut]); }                                              // every truncation point
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..3000 {                                                                             // random single-byte damage
+            let mut m = base.clone(); let at = (next() as usize) % m.len(); m[at] = next() as u8; run(&m);
+        }
+        for _ in 0..1500 {                                                                             // 8-byte windows set to 0xFF: huge counts / lengths
+            let mut m = base.clone(); let at = (next() as usize) % (m.len() - 8); for b in &mut m[at..at + 8] { *b = 0xFF; } run(&m);
+        }
+        (ok, err)
+    });
+    assert!(outcome.0 > 0 && outcome.1 > 0, "expected both accepted and rejected inputs, got {outcome:?}");
+}
+
+/// All 63 non-empty subsets of the six files x several memory budgets: the invariants of "27B and 4B are independent, each uses its own
+/// projector, 8-bit before 16-bit, nothing is chosen that cannot work" hold everywhere, and the folder's file ORDER never changes the choice.
+#[test]
+fn every_combination_of_the_six_files_obeys_the_selection_invariants() {
+    let all = [A8, A16, AV, B8, B16, BV];
+    for mask in 1u32..64 {
+        let items: Vec<Item> = all.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, it)| *it).collect();
+        let mut reversed = items.clone(); reversed.reverse();
+        let (_, inv) = folder(&format!("combo{mask}"), &items);
+        let (_, inv_rev) = folder(&format!("combor{mask}"), &reversed);
+        let has = |n: &str| items.iter().any(|(x, _, _)| *x == n);
+        for budget in [6.0, 12.0, 30.0, 60.0, 120.0] {
+            let a = choose(&inv, &cpu(budget));
+            let b = choose(&inv_rev, &cpu(budget));
+            assert_eq!(a.as_ref().map(file_name).ok(), b.as_ref().map(file_name).ok(), "order changed the choice: mask {mask} budget {budget}");
+            let Ok(p) = a else {
+                // an error is only acceptable when no variant can work at this budget
+                let usable_27 = (has("alpha-final.gguf") || has("alpha-full-precision.gguf")) && has("alpha-vision.gguf");
+                let usable_4 = has("beta-final.gguf") || has("beta-full.gguf");
+                assert!(!(usable_4 && budget >= 12.0), "a 4B model fits {budget} GB but nothing was chosen: mask {mask}");
+                assert!(!(usable_27 && budget >= 120.0), "27B fits {budget} GB but nothing was chosen: mask {mask}");
+                continue;
+            };
+            let name = file_name(&p);
+            match p.family {
+                Family::G27 => {
+                    assert!(name.starts_with("alpha-") && !name.contains("vision"), "{name}");
+                    assert!(p.multimodal && p.mmproj.as_ref().unwrap().ends_with("alpha-vision.gguf"), "27B must run with ITS projector (mask {mask})");
+                    if has("alpha-final.gguf") { assert_eq!(name, "alpha-final.gguf", "8-bit comes before 16-bit (mask {mask} budget {budget})"); }
+                }
+                Family::G4 => {
+                    assert!(name.starts_with("beta-") && !name.contains("vision"), "{name}");
+                    if has("beta-vision.gguf") { assert!(p.mmproj.as_ref().unwrap().ends_with("beta-vision.gguf"), "4B must run with ITS projector (mask {mask})"); } else { assert!(!p.multimodal); }
+                    if has("beta-final.gguf") { assert_eq!(name, "beta-final.gguf", "8-bit comes before 16-bit (mask {mask} budget {budget})"); }
+                    // 4B is only chosen when 27B is absent, unusable (no projector) or does not fit
+                    if budget >= 120.0 { assert!(!(has("alpha-vision.gguf") && (has("alpha-final.gguf") || has("alpha-full-precision.gguf"))), "27B should have won at {budget} GB (mask {mask})"); }
+                }
+            }
+            if budget >= 120.0 && has("alpha-vision.gguf") && has("alpha-final.gguf") { assert_eq!((p.family, name.as_str()), (Family::G27, "alpha-final.gguf"), "mask {mask}"); }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

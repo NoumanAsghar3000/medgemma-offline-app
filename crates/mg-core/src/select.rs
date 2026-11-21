@@ -123,6 +123,10 @@ fn is_split_part(name: &str) -> bool {
     l.find("-of-").map(|i| i >= 6 && l.as_bytes()[i - 5..i].iter().all(|b| b.is_ascii_digit()) && l[i + 4..].chars().take(5).all(|c| c.is_ascii_digit())).unwrap_or(false)
 }
 
+fn human_bytes(b: u64) -> String {
+    if b >= GIB { format!("{:.2} GB", b as f64 / GIB as f64) } else { format!("{:.1} MB", b as f64 / (1u64 << 20) as f64) }
+}
+
 pub fn enrich(inv: &mut Inventory) {
     for f in inv.files.iter_mut() {
         if is_split_part(&f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) && !f.is_mmproj {
@@ -149,6 +153,12 @@ pub fn enrich(inv: &mut Inventory) {
                         if claimed != g { f.warnings.push(format!("the file name or folder says {} but the file content is {}: the content is used", claimed.label(), g.label())); }
                     }
                     f.family = Some(g);
+                }
+                // INCOMPLETE copy / download: the tensor table says how big the file must be at least
+                if let Some(need) = i.expected_min_size {
+                    if f.size < need {
+                        f.problem = Some(format!("the file is INCOMPLETE ({} on disk, its header needs at least {}): an interrupted copy or download - copy it again", human_bytes(f.size), human_bytes(need)));
+                    }
                 }
                 f.info = Some(i);
             }

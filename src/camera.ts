@@ -33,6 +33,8 @@ export function cameraErrorMessage(e: unknown): string {
     case "OverconstrainedError":
     case "ConstraintNotSatisfiedError":
       return "The camera does not support the requested settings.";
+    case "CameraTimeout":
+      return "Timed out waiting for the camera. If Windows asked for permission, answer the prompt and try again.";
     case "NoMediaDevices":
       return "The camera API is not available in this window.";
     default:
@@ -85,23 +87,30 @@ export interface CameraDeps {
   open: () => Promise<MediaStream>;
   waitFrame: (video: { videoWidth: number }, ms: number) => Promise<boolean>;
   frameTimeoutMs: number;
+  /** How long to wait for getUserMedia (a permission prompt nobody answers must not leave the dialog hanging). Default 60 s; 0 = no limit. */
+  openTimeoutMs?: number;
 }
 
 const NO_FRAMES = "The camera started but is not delivering images. Close other apps that use the camera and try again.";
 const DISCONNECTED = "The camera was disconnected.";
+const MUTED = "The camera is blocked or paused. Check the camera's privacy shutter and Windows Settings > Privacy & security > Camera.";
 
 /**
- * One open camera dialog. Guarantees: Capture is enabled ONLY while real frames are arriving; a permission answer that arrives after the
- * dialog was closed (or re-opened) is discarded and its stream stopped; every stream is stopped on close; an unplugged camera disables Capture.
+ * One open camera dialog. Guarantees:
+ *  - Capture is enabled ONLY while real frames are arriving (not while opening, not after an error, not while the camera is muted/unplugged);
+ *  - a permission answer that arrives after the dialog was closed, re-opened or timed out is discarded and its stream stopped;
+ *  - every stream that is not in use is stopped (no leaked camera light): on close, on re-open, on error, on "no frames", on unplug;
+ *  - any number of rapid open() calls leave exactly one live stream.
  */
 export class CameraSession {
   private seq = 0;
   private stream: MediaStream | null = null;
   private shown = false;
+  private live = false;
 
   constructor(
     private readonly ui: CameraUI,
-    private readonly deps: CameraDeps = { open: () => openCameraStream(), waitFrame: waitForFrame, frameTimeoutMs: 15000 },
+    private readonly deps: CameraDeps = { open: () => openCameraStream(), waitFrame: waitForFrame, frameTimeoutMs: 15000, openTimeoutMs: 60000 },
   ) {}
 
   /** True while the dialog is on screen. */
@@ -110,37 +119,77 @@ export class CameraSession {
   async open(): Promise<void> {
     this.release();
     const seq = ++this.seq;
+    this.live = false;
     this.ui.setCaptureEnabled(false);
     this.ui.setError("");
     this.ui.show();
     this.shown = true;
+    let s: MediaStream | null = null;
     try {
-      const s = await this.deps.open();
-      if (seq !== this.seq) { stopStream(s); return; }          // closed or re-opened while the permission prompt was up
+      s = await this.acquire();
+      if (seq !== this.seq) { stopStream(s); return; }          // closed, re-opened or timed out while the permission prompt was up
       this.stream = s;
-      for (const t of s.getVideoTracks()) {
-        t.addEventListener("ended", () => {
-          if (seq !== this.seq || this.stream !== s) return;
-          this.ui.setError(DISCONNECTED);
-          this.ui.setCaptureEnabled(false);
-        });
+      const tracks = s.getVideoTracks();
+      for (const t of tracks) {
+        t.addEventListener("ended", () => { if (this.current(seq, s)) this.fail(DISCONNECTED); });
+        t.addEventListener("mute", () => { if (this.current(seq, s)) { this.ui.setCaptureEnabled(false); this.ui.setError(MUTED); } });
+        t.addEventListener("unmute", () => { if (this.current(seq, s) && this.live) { this.ui.setError(""); this.ui.setCaptureEnabled(true); } });
       }
+      if (tracks.length === 0 || tracks.some((t) => t.readyState === "ended")) return this.fail(DISCONNECTED);   // unplugged while the prompt was open
       this.ui.showStream(s);
       const ok = await this.deps.waitFrame(this.ui.video, this.deps.frameTimeoutMs);
       if (seq !== this.seq) return;
-      if (ok) this.ui.setCaptureEnabled(true); else this.ui.setError(NO_FRAMES);
+      if (!ok) return this.fail(NO_FRAMES);
+      this.live = true;
+      this.ui.setCaptureEnabled(true);
     } catch (e) {
-      if (seq === this.seq) this.ui.setError(cameraErrorMessage(e));
+      if (seq !== this.seq) { stopStream(s); return; }
+      this.fail(cameraErrorMessage(e));
     }
   }
 
   close(): void {
     this.seq++;
+    this.live = false;
     this.release();
-    this.ui.showStream(null);
+    this.detach();
     this.ui.setCaptureEnabled(false);
     this.ui.hide();
     this.shown = false;
+  }
+
+  /** getUserMedia with a deadline; a stream that arrives after the deadline is stopped, never kept. */
+  private acquire(): Promise<MediaStream> {
+    const limit = this.deps.openTimeoutMs ?? 60000;
+    const opening = this.deps.open();
+    if (!limit) return opening;
+    return new Promise<MediaStream>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        reject(Object.assign(new Error("timed out waiting for the camera"), { name: "CameraTimeout" }));
+      }, limit);
+      opening.then(
+        (st) => { clearTimeout(timer); if (settled) stopStream(st); else { settled = true; resolve(st); } },
+        (e) => { clearTimeout(timer); if (!settled) { settled = true; reject(e); } },
+      );
+    });
+  }
+
+  private current(seq: number, s: MediaStream | null): boolean { return seq === this.seq && this.stream === s; }
+
+  /** Error state: message shown, Capture disabled, camera released (light off), dialog stays up so the message can be read. */
+  private fail(message: string): void {
+    this.live = false;
+    this.release();
+    this.detach();
+    this.ui.setCaptureEnabled(false);
+    this.ui.setError(message);
+  }
+
+  /** Detaching is best-effort: a missing/broken video element must never stop the error path (or close()) from finishing. */
+  private detach(): void {
+    try { this.ui.showStream(null); } catch { /* element gone */ }
   }
 
   private release(): void {

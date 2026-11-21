@@ -51,7 +51,7 @@ test("waitForFrame resolves as soon as frames arrive, and reports false on timeo
 // ---------------------------------------------------------------------------------------------------------------------
 // CameraSession: the dialog logic, driven with fakes (no browser needed)
 // ---------------------------------------------------------------------------------------------------------------------
-class FakeTrack extends EventTarget { stopped = false; stop() { this.stopped = true; } }
+class FakeTrack extends EventTarget { stopped = false; readyState = "live"; stop() { this.stopped = true; this.readyState = "ended"; } }
 function makeStream() {
   const track = new FakeTrack();
   const stream = { getTracks: () => [track], getVideoTracks: () => [track] } as unknown as MediaStream;
@@ -140,4 +140,75 @@ test("an 'ended' event from an old, closed session is ignored", async () => {
   await s.open(); s.close(); ui.error = "";
   track.dispatchEvent(new Event("ended"));
   assert.equal(ui.error, "");
+});
+
+test("a camera unplugged while the permission prompt was open is reported at once and the stream is stopped", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream(); track.readyState = "ended";
+  await new CameraSession(ui, { open: async () => stream, waitFrame: frames, frameTimeoutMs: 1 }).open();
+  assert.match(ui.error, /disconnected/); assert.equal(ui.capture, false); assert.equal(track.stopped, true);
+});
+
+test("a camera that never delivers frames is RELEASED (camera light off), not left running behind the error", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream();
+  await new CameraSession(ui, { open: async () => stream, waitFrame: noFrames, frameTimeoutMs: 1 }).open();
+  assert.match(ui.error, /not delivering images/); assert.equal(track.stopped, true); assert.equal(ui.attached, null);
+});
+
+test("unplugging the camera releases it as well as disabling Capture", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream();
+  await new CameraSession(ui, { open: async () => stream, waitFrame: frames, frameTimeoutMs: 1 }).open();
+  track.dispatchEvent(new Event("ended"));
+  assert.equal(track.stopped, true); assert.equal(ui.capture, false); assert.equal(ui.attached, null);
+});
+
+test("a muted camera (privacy shutter / Windows privacy switch) disables Capture and re-enables it when frames return", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream();
+  await new CameraSession(ui, { open: async () => stream, waitFrame: frames, frameTimeoutMs: 1 }).open();
+  track.dispatchEvent(new Event("mute"));
+  assert.equal(ui.capture, false); assert.match(ui.error, /blocked or paused/);
+  track.dispatchEvent(new Event("unmute"));
+  assert.equal(ui.capture, true); assert.equal(ui.error, "");
+});
+
+test("a mute that happens before the first frame does not enable Capture on unmute", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream(); const gate = deferred<boolean>();
+  const opening = new CameraSession(ui, { open: async () => stream, waitFrame: () => gate.promise, frameTimeoutMs: 1 }).open();
+  await new Promise((r) => setTimeout(r, 5));
+  track.dispatchEvent(new Event("mute")); track.dispatchEvent(new Event("unmute"));
+  assert.equal(ui.capture, false, "no frame has arrived yet");
+  gate.resolve(true); await opening; assert.equal(ui.capture, true);
+});
+
+test("a permission prompt nobody answers times out with a clear message; a late answer is stopped, not kept", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream(); const permission = deferred<MediaStream>();
+  await new CameraSession(ui, { open: () => permission.promise, waitFrame: frames, frameTimeoutMs: 1, openTimeoutMs: 30 }).open();
+  assert.match(ui.error, /Timed out waiting for the camera/); assert.equal(ui.capture, false);
+  permission.resolve(stream); await new Promise((r) => setTimeout(r, 5));
+  assert.equal(track.stopped, true, "the stream that arrived after the deadline must be stopped");
+});
+
+test("if attaching the stream to the page throws, the stream is stopped and the error shown", async () => {
+  const { ui } = fakeUI(); const { stream, track } = makeStream();
+  ui.showStream = () => { throw new Error("video element missing"); };
+  await new CameraSession(ui, { open: async () => stream, waitFrame: frames, frameTimeoutMs: 1 }).open();
+  assert.match(ui.error, /video element missing/); assert.equal(track.stopped, true); assert.equal(ui.capture, false);
+});
+
+test("many rapid open() calls in any order leave exactly ONE live stream", async () => {
+  for (const order of [[0, 1, 2, 3, 4, 5], [5, 4, 3, 2, 1, 0], [2, 5, 0, 4, 1, 3]]) {
+    const { ui } = fakeUI(); const made = order.map(() => makeStream()); const gates = order.map(() => deferred<MediaStream>()); let n = 0;
+    const s = new CameraSession(ui, { open: () => gates[n++].promise, waitFrame: frames, frameTimeoutMs: 1 });
+    const calls = order.map(() => s.open());
+    for (const i of order) gates[i].resolve(made[i].stream);                       // the permission answers arrive in a scrambled order
+    await Promise.all(calls);
+    const live = made.filter((m) => !m.track.stopped);
+    assert.equal(live.length, 1, `order ${order}: ${live.length} streams still running`);
+    assert.equal(ui.attached, live[0].stream, "the newest open() owns the stream");
+    s.close(); assert.equal(made.filter((m) => !m.track.stopped).length, 0, "close() stops everything");
+  }
+});
+
+test("close() is idempotent and safe before any open()", () => {
+  const { ui } = fakeUI(); const s = new CameraSession(ui, { open: async () => makeStream().stream, waitFrame: frames, frameTimeoutMs: 1 });
+  s.close(); s.close(); assert.equal(ui.visible, false); assert.equal(s.visible, false);
 });

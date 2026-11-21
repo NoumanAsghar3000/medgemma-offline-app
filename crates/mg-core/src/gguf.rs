@@ -21,6 +21,9 @@ pub struct GgufInfo {
     pub projection_dim: Option<u64>,
     /// ggml tensor type of the largest 2-D weight tensor (read from the tensor table, not from a file name): the real precision.
     pub weight_type: Option<u32>,
+    /// Lower bound of the file size implied by the tensor table (data start + furthest known tensor end). A smaller file is an
+    /// INCOMPLETE copy / download. None when the table is missing or unreadable (header-only exports).
+    pub expected_min_size: Option<u64>,
 }
 
 /// llama.cpp `llama_ftype` values -> the quant tags used in file names.
@@ -74,30 +77,44 @@ fn read_scalar_u64(r: &mut impl Read, t: u32) -> Result<Option<u64>, String> {
     })
 }
 
-fn skip_value(r: &mut (impl Read + Seek), t: u32) -> Result<(), String> {
+/// Forward-only skip of `n` bytes that must stay inside the file: corrupt lengths (huge, or >i64::MAX which would seek BACKWARDS and loop forever)
+/// are rejected instead of followed.
+fn skip_bytes(r: &mut (impl Read + Seek), n: u64, file_len: u64) -> Result<(), String> {
+    let pos = r.stream_position().map_err(|e| e.to_string())?;
+    if n > file_len || pos.saturating_add(n) > file_len { return Err(format!("corrupt header: a value of {n} bytes runs past the end of the file")); }
+    r.seek_relative(n as i64).map_err(|e| e.to_string())
+}
+
+fn skip_value(r: &mut (impl Read + Seek), t: u32, file_len: u64) -> Result<(), String> {
     match t {
-        8 => { let n = u64_(r)?; r.seek_relative(n as i64).map_err(|e| e.to_string()) }
+        8 => { let n = u64_(r)?; skip_bytes(r, n, file_len) }
         9 => {
             let et = u32_(r)?; let n = u64_(r)?;
-            if let Some(sz) = scalar_size(et) { r.seek_relative((n * sz) as i64).map_err(|e| e.to_string()) }
-            else if et == 8 { for _ in 0..n { let l = u64_(r)?; r.seek_relative(l as i64).map_err(|e| e.to_string())?; } Ok(()) }
+            if n > 100_000_000 { return Err(format!("corrupt header: implausible array length {n}")); }
+            if let Some(sz) = scalar_size(et) { skip_bytes(r, n * sz, file_len) }          // n <= 1e8 and sz <= 8: no overflow
+            else if et == 8 { for _ in 0..n { let l = u64_(r)?; skip_bytes(r, l, file_len)?; } Ok(()) }
             else { Err("nested arrays are not supported".into()) }
         }
-        _ => scalar_size(t).map(|s| r.seek_relative(s as i64).map_err(|e| e.to_string())).unwrap_or_else(|| Err(format!("unsupported value type {t}"))),
+        _ => scalar_size(t).map(|s| skip_bytes(r, s, file_len)).unwrap_or_else(|| Err(format!("unsupported value type {t}"))),
     }
 }
 
 pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
     let f = File::open(path).map_err(|e| e.to_string())?;
+    let file_len = f.metadata().map_err(|e| e.to_string())?.len();
     let mut r = BufReader::with_capacity(256 * 1024, f);
     if &rd::<4>(&mut r)? != b"GGUF" { return Err("not a GGUF file (bad magic)".into()); }
     let mut info = GgufInfo { version: u32_(&mut r)?, ..Default::default() };
-    if !(2..=3).contains(&info.version) { return Err(format!("unsupported GGUF version {}", info.version)); }
+    if !(2..=3).contains(&info.version) {
+        if (2..=3).contains(&info.version.swap_bytes()) { return Err("big-endian GGUF files are not supported (convert it again for a little-endian machine)".into()); }
+        return Err(format!("unsupported GGUF version {}", info.version));
+    }
     let tensors = u64_(&mut r)?; let kvs = u64_(&mut r)?;
     if kvs > 100_000 { return Err("implausible metadata size".into()); }
+    let mut align: u64 = 32;
     for _ in 0..kvs {
         let key = string(&mut r, 1 << 16)?; let t = u32_(&mut r)?;
-        let want_u = key == "general.file_type" || key.ends_with(".block_count") || key.ends_with(".embedding_length") || key == "clip.vision.projection_dim";
+        let want_u = key == "general.file_type" || key == "general.alignment" || key.ends_with(".block_count") || key.ends_with(".embedding_length") || key == "clip.vision.projection_dim";
         match (key.as_str(), t) {
             ("general.architecture", 8) => info.arch = string(&mut r, 1 << 16)?,
             ("general.name", 8) => info.name = Some(string(&mut r, 1 << 16)?),
@@ -105,6 +122,7 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
             _ if want_u && t != 8 && t != 9 => {
                 let v = read_scalar_u64(&mut r, t)?;
                 match key.as_str() {
+                    "general.alignment" => { if let Some(a) = v { if (1..=1 << 20).contains(&a) { align = a; } } }
                     "general.file_type" => info.file_type = v.map(|x| x as u32),
                     "clip.vision.projection_dim" => info.projection_dim = v,
                     k if k.ends_with(".block_count") && info.block_count.is_none() => info.block_count = v,
@@ -112,28 +130,47 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
                     _ => {}
                 }
             }
-            _ => skip_value(&mut r, t)?,
+            _ => skip_value(&mut r, t, file_len)?,
         }
     }
     if info.arch.is_empty() { return Err("GGUF has no general.architecture".into()); }
     // The tensor table follows the metadata. A problem in it (header-only fixtures, truncated downloads) never fails detection:
     // the metadata alone already identified the file, the table only refines the precision.
-    info.weight_type = read_weight_type(&mut r, tensors).ok().flatten();
+    if let Ok(t) = read_tensor_table(&mut r, tensors) {
+        info.weight_type = t.weight_type;
+        if let Some(end) = t.data_end { info.expected_min_size = Some(t.table_end.div_ceil(align).saturating_mul(align).saturating_add(end)); }
+    }
     Ok(info)
 }
 
-/// ggml type of the 2-D tensor with the most elements (the token embedding / big FFN matrices: what the file is really made of).
-fn read_weight_type(r: &mut impl Read, count: u64) -> Result<Option<u32>, String> {
-    if count == 0 || count > 100_000 { return Ok(None); }
-    let mut best: Option<(u64, u32)> = None;
+/// Bytes a tensor occupies, for the types whose block layout is certain (None = unknown: that tensor is left out of the size bound).
+fn tensor_bytes(ty: u32, elems: u64) -> Option<u64> {
+    let (block, bytes): (u64, u64) = match ty {
+        0 => (1, 4), 1 | 30 => (1, 2), 2 => (32, 18), 3 => (32, 20), 6 => (32, 22), 7 => (32, 24), 8 => (32, 34), 9 => (32, 36),
+        10 => (256, 84), 11 => (256, 110), 12 => (256, 144), 13 => (256, 176), 14 => (256, 210), 15 => (256, 292),
+        _ => return None,
+    };
+    if elems % block != 0 { return None; }
+    (elems / block).checked_mul(bytes)
+}
+
+struct TensorTable { weight_type: Option<u32>, data_end: Option<u64>, table_end: u64 }
+
+/// Reads the tensor table: the ggml type of the 2-D tensor with the most elements (the token embedding / big FFN matrices: what the file is
+/// really made of) and the furthest byte any known tensor reaches (relative to the start of the data section).
+fn read_tensor_table(r: &mut (impl Read + Seek), count: u64) -> Result<TensorTable, String> {
+    if count == 0 || count > 100_000 { return Err("no usable tensor table".into()); }
+    let mut best: Option<(u64, u32)> = None; let mut data_end: Option<u64> = None;
     for _ in 0..count {
         let _name = string(r, 1 << 16)?;
         let nd = u32_(r)?; if nd == 0 || nd > 8 { return Err("implausible tensor dimension count".into()); }
         let mut elems: u64 = 1; for _ in 0..nd { elems = elems.saturating_mul(u64_(r)?); }
-        let ty = u32_(r)?; let _off = u64_(r)?;
+        let ty = u32_(r)?; let off = u64_(r)?;
         if nd >= 2 && best.map(|(e, _)| elems > e).unwrap_or(true) { best = Some((elems, ty)); }
+        if let Some(n) = tensor_bytes(ty, elems) { let end = off.saturating_add(n); data_end = Some(data_end.map(|d| d.max(end)).unwrap_or(end)); }
     }
-    Ok(best.map(|(_, t)| t))
+    let table_end = r.stream_position().map_err(|e| e.to_string())?;
+    Ok(TensorTable { weight_type: best.map(|(_, t)| t), data_end, table_end })
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -169,6 +206,7 @@ pub fn check_pair(family: Family, model: &GgufInfo, mmproj: Option<(&str, &GgufI
     }
     c
 }
+
 
 #[cfg(test)]
 mod tests {

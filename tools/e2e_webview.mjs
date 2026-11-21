@@ -15,6 +15,7 @@ import { PDFDocument, StandardFonts } from "pdf-lib";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import { makeDocx } from "./make_docx.mjs";
 import { createCdp, sleep } from "./cdp.mjs";
+import { analyzeBrowserArgs, buildBrowserArgs, parseDevToolsActivePort, pickFreePort } from "./e2e_support.mjs";
 
 async function pdfText(file) {   // real text extraction (pdf-lib compresses content streams, so grepping bytes proves nothing)
   const doc = await pdfjs.getDocument({ data: new Uint8Array(readFileSync(file)), verbosity: 0 }).promise;
@@ -25,41 +26,65 @@ async function pdfText(file) {   // real text extraction (pdf-lib compresses con
 const { APP_EXE, GOOD_MODELS, WORK_DIR } = process.env;
 if (!APP_EXE || !GOOD_MODELS || !WORK_DIR) { console.error("APP_EXE, GOOD_MODELS, WORK_DIR required"); process.exit(2); }
 mkdirSync(WORK_DIR, { recursive: true });
-const PORT = 9333, PDF_OUT = path.join(WORK_DIR, "saved-report.pdf"), APP_LOG = path.join(WORK_DIR, "app.log");
+let PORT = await pickFreePort(9333);
+const PDF_OUT = path.join(WORK_DIR, "saved-report.pdf"), APP_LOG = path.join(WORK_DIR, "app.log");
 const results = [];
 const check = (name, ok, detail = "", required = true) => { results.push({ name, ok: !!ok, detail: String(detail).slice(0, 300), required }); console.log(`${ok ? "PASS" : (required ? "FAIL" : "SOFT-FAIL")}  ${name}${detail ? "  - " + String(detail).slice(0, 200) : ""}`); };
 
 // ---- start the app with a debuggable WebView2 and a FAKE camera.
-// A FRESH WebView2 user-data folder is used on purpose: WebView2 refuses to start (and the window never appears) when another
+// A FRESH WebView2 user-data folder is used on purpose (and a different one for the retry): WebView2 refuses to start the window when another
 // instance already owns the same user-data folder with different browser arguments, e.g. a leftover from an earlier test step.
-// The default wry argument (--disable-features=...) is repeated because passing arguments through the API REPLACES wry's defaults.
-const BROWSER_ARGS = `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=${PORT} --remote-allow-origins=* --use-fake-device-for-media-stream --use-fake-ui-for-media-stream`;
-const env = { ...process.env, MG_TEST_PICK_FOLDER: GOOD_MODELS, MG_TEST_SAVE_PATH: PDF_OUT,
-  WEBVIEW2_USER_DATA_FOLDER: path.join(WORK_DIR, "webview2-data"),
-  MG_TEST_BROWSER_ARGS: BROWSER_ARGS,
-  WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: BROWSER_ARGS };
-const logFd = openSync(APP_LOG, "w");   // keep the app's stdout/stderr: it was thrown away before, which made failures undiagnosable
-const app = spawn(APP_EXE, [], { env, stdio: ["ignore", logFd, logFd], detached: false });
-let appExited = false, appExitCode = null; app.on("exit", (c) => { appExited = true; appExitCode = c; }); app.on("error", (e) => console.log("spawn error: " + e.message));
-
-function diagnostics() {
-  const run = (c) => { try { return execSync(c, { encoding: "utf8", timeout: 30000 }); } catch (e) { return String(e.stdout || e.message); } };
-  console.log("--- DIAG app exited: " + appExited + " code: " + appExitCode);
-  console.log("--- DIAG related processes:\n" + run('tasklist | findstr /I "medgemma llama msedgewebview2 setup"'));
-  console.log("--- DIAG port " + PORT + ":\n" + run("netstat -ano | findstr :" + PORT));
-  // the command line of every WebView2 process shows whether --remote-debugging-port really reached the browser process
-  console.log("--- DIAG command lines:\n" + run(`powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'msedgewebview2*' -or $_.Name -like 'medgemma*' } | ForEach-Object { ($_.ProcessId.ToString() + ' ' + $_.CommandLine) }"`).slice(0, 8000));
-  console.log("--- DIAG app output:\n" + (existsSync(APP_LOG) ? readFileSync(APP_LOG, "utf8").slice(-3000) : "(none)"));
-  console.log("--- DIAG webview2 data folder:\n" + run('dir "' + path.join(WORK_DIR, "webview2-data") + '" /b'));
+// The browser arguments go in through MG_TEST_BROWSER_ARGS (-> additional_browser_args in the app); the environment variable is set as well.
+const udf = (attempt) => path.join(WORK_DIR, attempt > 1 ? `webview2-data-${attempt}` : "webview2-data");
+let app, appExited = false, appExitCode = null, attemptNo = 0;
+function launch(attempt) {
+  attemptNo = attempt; appExited = false; appExitCode = null;
+  const args = buildBrowserArgs(PORT);
+  const env = { ...process.env, MG_TEST_PICK_FOLDER: GOOD_MODELS, MG_TEST_SAVE_PATH: PDF_OUT, WEBVIEW2_USER_DATA_FOLDER: udf(attempt),
+    MG_TEST_BROWSER_ARGS: args, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: args };
+  const logFd = openSync(APP_LOG, attempt > 1 ? "a" : "w");   // keep the app's stdout/stderr: it was thrown away before, which made failures undiagnosable
+  console.log(`--- launching the app (attempt ${attempt}, debug port ${PORT}, user-data ${udf(attempt)})`);
+  const child = spawn(APP_EXE, [], { env, stdio: ["ignore", logFd, logFd], detached: false });
+  app = child;
+  child.on("exit", (c) => { if (app === child) { appExited = true; appExitCode = c; } });
+  child.on("error", (e) => console.log("spawn error: " + e.message));
+}
+function killApp() {
+  try { app?.kill(); } catch {}
+  try { if (app?.pid) execSync(`taskkill /F /T /PID ${app.pid}`, { stdio: "ignore" }); } catch {}
 }
 
-async function targetWs() {
-  for (let i = 0; i < 120 && !appExited; i++) {
+const run = (c) => { try { return execSync(c, { encoding: "utf8", timeout: 30000 }); } catch (e) { return String(e.stdout || e.message); } };
+const PS_LINES = `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'msedgewebview2*' -or $_.Name -like 'medgemma*' } | ForEach-Object { ($_.ProcessId.ToString() + ' ' + $_.CommandLine) }"`;
+const PS_RUNTIME = `powershell -NoProfile -Command "(Get-ItemProperty 'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv"`;
+
+/** Prints everything needed to understand a missing debug endpoint, ending with a plain VERDICT, and returns that verdict. */
+function diagnostics(label = "") {
+  console.log(`--- DIAG ${label} app exited: ${appExited} code: ${appExitCode}`);
+  console.log("--- DIAG WebView2 runtime version: " + run(PS_RUNTIME).trim());
+  console.log("--- DIAG related processes:\n" + run('tasklist | findstr /I "medgemma llama msedgewebview2 setup"'));
+  console.log("--- DIAG port " + PORT + ":\n" + run("netstat -ano | findstr :" + PORT));
+  const lines = run(PS_LINES);
+  console.log("--- DIAG command lines:\n" + lines.slice(0, 8000));
+  const af = path.join(udf(attemptNo), "EBWebView", "DevToolsActivePort");
+  console.log("--- DIAG DevToolsActivePort: " + (existsSync(af) ? readFileSync(af, "utf8").replace(/\r?\n/g, " | ") : "(file not written: remote debugging never started)"));
+  console.log("--- DIAG app output:\n" + (existsSync(APP_LOG) ? readFileSync(APP_LOG, "utf8").slice(-3000) : "(none)"));
+  console.log("--- DIAG user-data folder:\n" + run('dir "' + udf(attemptNo) + '" /b'));
+  const v = analyzeBrowserArgs(lines, PORT);
+  console.log(`--- VERDICT [${v.code}] ${v.message}`);
+  console.log(`--- VERDICT fake-camera flags in the browser process: device=${v.hasFakeDevice} ui=${v.hasFakeUi}`);
+  return v;
+}
+
+/** Looks for the DevTools page endpoint for `seconds`; also follows the port that WebView2 itself reports in DevToolsActivePort. Returns null on failure. */
+async function targetWs(seconds) {
+  for (let i = 0; i < seconds && !appExited; i++) {
+    const portFile = path.join(udf(attemptNo), "EBWebView", "DevToolsActivePort");
+    if (existsSync(portFile)) { const p = parseDevToolsActivePort(readFileSync(portFile, "utf8")); if (p && p !== PORT) { console.log(`--- WebView2 reports its debug port as ${p} (expected ${PORT}): following it`); PORT = p; } }
     try { const l = await (await fetch(`http://127.0.0.1:${PORT}/json`, { signal: AbortSignal.timeout(3000) })).json(); const t = l.find((x) => x.type === "page" && x.webSocketDebuggerUrl); if (t) return t.webSocketDebuggerUrl; } catch { /* not up yet */ }
     await sleep(1000);
   }
-  diagnostics();
-  throw new Error("WebView2 debugging endpoint never came up (app exited: " + appExited + ")");
+  return null;
 }
 const cdp = createCdp();
 const { send, ev, waitFor, click, text, setFiles } = cdp;
@@ -76,7 +101,7 @@ function png(w, h) {   // tiny valid RGB PNG (no deps)
 function cleanup() {
   cdp.close();
   try { execSync("taskkill /F /T /IM llama-server.exe", { stdio: "ignore" }); } catch {}
-  try { app.kill(); execSync(`taskkill /F /T /PID ${app.pid}`, { stdio: "ignore" }); } catch {}
+  killApp();
 }
 function writeResults() { writeFileSync(path.join(WORK_DIR, "e2e-results.json"), JSON.stringify(results, null, 2)); }
 // the whole run must finish: a hang must produce diagnostics and a failure, never a stuck job
@@ -87,7 +112,17 @@ const watchdog = setTimeout(() => {
 }, WATCHDOG_MS);
 
 try {
-  const url = await targetWs();
+  // two attempts: the first start of WebView2 on a fresh runner profile can be slow or fail; the retry uses a brand-new user-data folder
+  let url = null; let verdict = null;
+  for (const attempt of [1, 2]) {
+    launch(attempt);
+    url = await targetWs(Number(process.env[`E2E_ENDPOINT_WAIT_${attempt}`] || (attempt === 1 ? 75 : 120)));
+    if (url) break;
+    verdict = diagnostics(`attempt ${attempt}`);
+    if (attempt === 1) { console.log("--- the debug endpoint did not come up: restarting the app once with a fresh user-data folder"); killApp(); await sleep(Number(process.env.E2E_RETRY_PAUSE_MS || 4000)); }
+  }
+  if (!url) { check("WebView2 accepted the browser arguments and exposed the debug endpoint", false, `${verdict?.code}: ${verdict?.message}`); throw new Error(`WebView2 debugging endpoint never came up [${verdict?.code}]`); }
+  check("WebView2 accepted the browser arguments (debug endpoint up)", true, `attempt ${attemptNo}, port ${PORT}`);
   await cdp.connect(url);
   await send("Runtime.enable"); await send("DOM.enable"); await send("Page.enable");
   check("real WebView2 UI loaded and scripted over DevTools", true, url);
