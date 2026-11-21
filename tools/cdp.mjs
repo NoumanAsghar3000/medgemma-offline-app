@@ -4,6 +4,52 @@ import WebSocket from "ws";
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Says exactly what is (not) on the DevTools port. state:
+ *   ok              a DevTools endpoint with a page target answered
+ *   refused         nothing listens on the port (the debug flag never took effect, or the app is not running)
+ *   timeout         the port accepts but never answers (filtered / hung process)
+ *   http-error      something answers HTTP but not with 200
+ *   not-json        something listens that is not a DevTools endpoint (the port belongs to another program)
+ *   no-page-target  DevTools listens but exposes no page (window not created yet / crashed)
+ *   error           anything else (detail has the system error)
+ */
+export async function probeEndpoint(port, { timeoutMs = 3000, host = "127.0.0.1" } = {}) {
+  const url = `http://${host}:${port}/json`;
+  let res;
+  try { res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (e) {
+    const code = e?.cause?.code || e?.code || "";
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") return { state: "timeout", detail: `no answer from ${url} within ${timeoutMs} ms (port filtered or process hung)` };
+    if (code === "ECONNREFUSED") return { state: "refused", detail: `nothing is listening on ${host}:${port}` };
+    return { state: "error", detail: `${code || e?.name}: ${e?.message}` };
+  }
+  if (!res.ok) return { state: "http-error", detail: `HTTP ${res.status} from ${url}` };
+  let list;
+  try { list = await res.json(); } catch { return { state: "not-json", detail: `${url} did not return JSON: another program listens on this port` }; }
+  if (!Array.isArray(list)) return { state: "not-json", detail: `${url} returned JSON that is not a DevTools target list` };
+  const page = list.find((t) => t && t.type === "page" && t.webSocketDebuggerUrl);
+  if (!page) return { state: "no-page-target", detail: `DevTools is listening but exposes no page (targets: ${list.map((t) => t?.type).join(", ") || "none"})`, targets: list.map((t) => t?.type) };
+  return { state: "ok", detail: "page target found", wsUrl: page.webSocketDebuggerUrl };
+}
+
+/**
+ * Polls probeEndpoint until it is ok, `seconds` pass, or the app dies. The result carries `tally` (how often each state was seen), which is
+ * what tells "never listened" (all refused) from "listened but broken" (some other state) in the final verdict.
+ */
+export async function waitForEndpoint(getPort, seconds, { isAlive = () => true, pollMs = 1000, onTick } = {}) {
+  const tally = {}; let last = { state: "refused", detail: "not probed yet" };
+  for (let i = 0; i < seconds; i++) {
+    if (!isAlive()) return { ...last, tally, appDied: true };
+    if (onTick) await onTick(i);
+    last = await probeEndpoint(getPort());
+    tally[last.state] = (tally[last.state] || 0) + 1;
+    if (last.state === "ok") return { ...last, tally };
+    await sleep(pollMs);
+  }
+  return { ...last, tally };
+}
+
 export function createCdp({ timeoutMs = 45000 } = {}) {
   let ws = null; let nextId = 1; const pending = new Map();
 

@@ -3,7 +3,9 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { WebSocketServer } from "ws";
-import { createCdp, sleep } from "./cdp.mjs";
+import http from "node:http";
+import net from "node:net";
+import { createCdp, probeEndpoint, sleep, waitForEndpoint } from "./cdp.mjs";
 
 function freePort() { return 20000 + Math.floor(Math.random() * 20000); }
 
@@ -133,4 +135,80 @@ test("setFiles drives the DevTools file-input protocol and fires 'change'", asyn
   await cdp.setFiles(["/tmp/a.docx"]);
   assert.deepEqual(seen, ["change"]);
   cdp.close(); await stop(m);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// probeEndpoint / waitForEndpoint: every way a debug port can be "not there" is told apart
+// ---------------------------------------------------------------------------------------------------------------------
+function httpServer(handler) {
+  return new Promise((resolve) => { const srv = http.createServer(handler); srv.listen(0, "127.0.0.1", () => { servers.push({ wss: { clients: [], close: () => srv.close() } }); resolve({ srv, port: srv.address().port }); }); });
+}
+const closed = (srv) => new Promise((r) => { srv.closeAllConnections?.(); srv.close(r); });
+
+test("probe: ok when a DevTools page target answers", async () => {
+  const { srv, port } = await httpServer((req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify([{ type: "page", webSocketDebuggerUrl: "ws://x/y" }])); });
+  const p = await probeEndpoint(port); assert.equal(p.state, "ok"); assert.equal(p.wsUrl, "ws://x/y"); await closed(srv);
+});
+
+test("probe: refused when nothing listens (the debug flag never took effect)", async () => {
+  const free = await new Promise((r) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
+  const p = await probeEndpoint(free); assert.equal(p.state, "refused"); assert.match(p.detail, /nothing is listening/);
+});
+
+test("probe: timeout when the port accepts but never answers", async () => {
+  const { srv, port } = await httpServer(() => { /* never answer */ });
+  const p = await probeEndpoint(port, { timeoutMs: 200 }); assert.equal(p.state, "timeout"); assert.match(p.detail, /within 200 ms/); await closed(srv);
+});
+
+test("probe: http-error, not-json and non-list JSON are told apart (another program owns the port)", async () => {
+  const cases = [[(req, res) => { res.statusCode = 503; res.end("busy"); }, "http-error", /HTTP 503/], [(req, res) => { res.end("<html>router admin page</html>"); }, "not-json", /another program/],
+                 [(req, res) => { res.setHeader("content-type", "application/json"); res.end('{"hello":"world"}'); }, "not-json", /not a DevTools target list/]];
+  for (const [handler, state, rx] of cases) { const { srv, port } = await httpServer(handler); const p = await probeEndpoint(port); assert.equal(p.state, state); assert.match(p.detail, rx); await closed(srv); }
+});
+
+test("probe: no-page-target when DevTools listens but the window does not exist", async () => {
+  const { srv, port } = await httpServer((req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify([{ type: "service_worker" }, { type: "browser" }])); });
+  const p = await probeEndpoint(port); assert.equal(p.state, "no-page-target"); assert.deepEqual(p.targets, ["service_worker", "browser"]); assert.match(p.detail, /service_worker, browser/); await closed(srv);
+});
+
+test("waitForEndpoint tallies what it saw: all 'refused' means the port never opened", async () => {
+  const free = await new Promise((r) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
+  const r = await waitForEndpoint(() => free, 3, { pollMs: 50 });
+  assert.equal(r.state, "refused"); assert.deepEqual(r.tally, { refused: 3 });
+});
+
+test("waitForEndpoint succeeds when the endpoint appears late, and reports the earlier refusals", async () => {
+  const free = await new Promise((r) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
+  let late;
+  setTimeout(() => { late = http.createServer((q, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify([{ type: "page", webSocketDebuggerUrl: "ws://late" }])); }); late.listen(free, "127.0.0.1"); }, 300);
+  const r = await waitForEndpoint(() => free, 20, { pollMs: 100 });
+  assert.equal(r.state, "ok"); assert.ok(r.tally.refused >= 2 && r.tally.ok === 1, JSON.stringify(r.tally)); await closed(late);
+});
+
+test("waitForEndpoint stops at once when the app dies, and says so", async () => {
+  let alive = true; setTimeout(() => { alive = false; }, 250);
+  const t0 = Date.now();
+  const r = await waitForEndpoint(() => 9, 60, { isAlive: () => alive, pollMs: 100 });
+  assert.equal(r.appDied, true); assert.ok(Date.now() - t0 < 5000);
+});
+
+test("waitForEndpoint follows a port that changes while waiting", async () => {
+  const { srv, port } = await httpServer((q, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify([{ type: "page", webSocketDebuggerUrl: "ws://moved" }])); });
+  let current = 1; setTimeout(() => { current = port; }, 250);
+  const r = await waitForEndpoint(() => current, 20, { pollMs: 100 }); assert.equal(r.state, "ok"); assert.equal(r.wsUrl, "ws://moved"); await closed(srv);
+});
+
+test("concurrent commands are matched to their own replies; events and garbage frames are ignored", async () => {
+  const port = freePort(); const dom = fakeDom(); dom.els["#a"] = { disabled: false };
+  const wss = new WebSocketServer({ port }); servers.push({ wss });
+  wss.on("connection", (sock) => sock.on("message", (m) => {
+    const { id, method, params } = JSON.parse(m);
+    sock.send("this is not json"); sock.send(JSON.stringify({ method: "Page.frameNavigated", params: {} }));          // noise before the answer
+    const delay = method === "Runtime.evaluate" ? Number(String(params.expression).match(/\d+/)?.[0] ?? 0) : 0;
+    setTimeout(() => sock.send(JSON.stringify({ id, result: { result: { value: params.expression } } })), delay);
+  }));
+  const cdp = newCdp(); await cdp.connect(`ws://127.0.0.1:${port}`);
+  const answers = await Promise.all([cdp.ev("'slow 120'"), cdp.ev("'fast 1'"), cdp.ev("'mid 40'")]);
+  assert.deepEqual(answers, ["'slow 120'", "'fast 1'", "'mid 40'"]);
+  cdp.close();
 });

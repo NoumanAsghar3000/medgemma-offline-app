@@ -14,8 +14,8 @@ import zlib from "node:zlib";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import { makeDocx } from "./make_docx.mjs";
-import { createCdp, sleep } from "./cdp.mjs";
-import { analyzeBrowserArgs, buildBrowserArgs, parseDevToolsActivePort, pickFreePort } from "./e2e_support.mjs";
+import { createCdp, sleep, waitForEndpoint } from "./cdp.mjs";
+import { analyzeBrowserArgs, buildBrowserArgs, finalVerdict, parseDevToolsActivePort, pickFreePort } from "./e2e_support.mjs";
 
 async function pdfText(file) {   // real text extraction (pdf-lib compresses content streams, so grepping bytes proves nothing)
   const doc = await pdfjs.getDocument({ data: new Uint8Array(readFileSync(file)), verbosity: 0 }).promise;
@@ -64,7 +64,8 @@ function diagnostics(label = "") {
   console.log("--- DIAG WebView2 runtime version: " + run(PS_RUNTIME).trim());
   console.log("--- DIAG related processes:\n" + run('tasklist | findstr /I "medgemma llama msedgewebview2 setup"'));
   console.log("--- DIAG port " + PORT + ":\n" + run("netstat -ano | findstr :" + PORT));
-  const lines = run(PS_LINES);
+  // E2E_CMDLINES_FILE is a TEST SEAM (tools/e2e_startup.test.mjs): it stands in for the PowerShell process listing on non-Windows machines.
+  const lines = process.env.E2E_CMDLINES_FILE ? readFileSync(process.env.E2E_CMDLINES_FILE, "utf8") : run(PS_LINES);
   console.log("--- DIAG command lines:\n" + lines.slice(0, 8000));
   const af = path.join(udf(attemptNo), "EBWebView", "DevToolsActivePort");
   console.log("--- DIAG DevToolsActivePort: " + (existsSync(af) ? readFileSync(af, "utf8").replace(/\r?\n/g, " | ") : "(file not written: remote debugging never started)"));
@@ -76,16 +77,22 @@ function diagnostics(label = "") {
   return v;
 }
 
-/** Looks for the DevTools page endpoint for `seconds`; also follows the port that WebView2 itself reports in DevToolsActivePort. Returns null on failure. */
-async function targetWs(seconds) {
-  for (let i = 0; i < seconds && !appExited; i++) {
-    const portFile = path.join(udf(attemptNo), "EBWebView", "DevToolsActivePort");
-    if (existsSync(portFile)) { const p = parseDevToolsActivePort(readFileSync(portFile, "utf8")); if (p && p !== PORT) { console.log(`--- WebView2 reports its debug port as ${p} (expected ${PORT}): following it`); PORT = p; } }
-    try { const l = await (await fetch(`http://127.0.0.1:${PORT}/json`, { signal: AbortSignal.timeout(3000) })).json(); const t = l.find((x) => x.type === "page" && x.webSocketDebuggerUrl); if (t) return t.webSocketDebuggerUrl; } catch { /* not up yet */ }
-    await sleep(1000);
-  }
-  return null;
+/** Follows the port WebView2 itself reports in DevToolsActivePort (e.g. when the requested port was taken). */
+function followPortFile() {
+  const portFile = path.join(udf(attemptNo), "EBWebView", "DevToolsActivePort");
+  if (!existsSync(portFile)) return;
+  const p = parseDevToolsActivePort(readFileSync(portFile, "utf8"));
+  if (p && p !== PORT) { console.log(`--- WebView2 reports its debug port as ${p} (expected ${PORT}): following it`); PORT = p; }
 }
+
+let lastProbe = null;   // what the debug port last answered (ok / refused / timeout / not-json / ...), with a tally of everything seen
+/** Waits up to `seconds` for a DevTools page endpoint, classifying every answer. Returns the page's websocket URL, or null. */
+async function awaitEndpoint(seconds) {
+  lastProbe = await waitForEndpoint(() => PORT, seconds, { isAlive: () => !appExited, onTick: followPortFile });
+  console.log(`--- debug port probe (attempt ${attemptNo}, port ${PORT}): ${lastProbe.state} ${JSON.stringify(lastProbe.tally)} - ${lastProbe.detail}`);
+  return lastProbe.state === "ok" ? lastProbe.wsUrl : null;
+}
+
 const cdp = createCdp();
 const { send, ev, waitFor, click, text, setFiles } = cdp;
 
@@ -104,24 +111,43 @@ function cleanup() {
   killApp();
 }
 function writeResults() { writeFileSync(path.join(WORK_DIR, "e2e-results.json"), JSON.stringify(results, null, 2)); }
+let startupVerdict = null;   // set when the debug endpoint never came up
+/** The one line a human reads first, plus a machine-readable copy (e2e-verdict.json) for the report. */
+function conclude(extra = {}) {
+  const failed = results.filter((r) => !r.ok && r.required);
+  let v;
+  if (extra.headline) v = { code: extra.code ?? "ABORTED", headline: extra.headline, explanation: extra.explanation ?? "", nextSteps: [] };
+  else if (startupVerdict && startupVerdict.code !== "OK") v = startupVerdict;
+  else if (failed.length) v = { code: "CHECK_FAILED", headline: `E2E FAILED AT: ${failed[0].name}`, explanation: failed[0].detail, nextSteps: ["Read e2e-console.txt and e2e-results.json; screenshots are not taken, the page text above each failure is the evidence."] };
+  else v = { code: "PASSED", headline: "E2E PASSED", explanation: `${results.filter((r) => r.ok).length}/${results.length} checks`, nextSteps: [] };
+  const out = { ...v, port: PORT, attempts: attemptNo, passed: results.filter((r) => r.ok).length, total: results.length, failedChecks: failed.map((r) => r.name), probe: lastProbe };
+  try { writeFileSync(path.join(WORK_DIR, "e2e-verdict.json"), JSON.stringify(out, null, 2)); } catch {}
+  console.log(`\n=== E2E FINAL VERDICT: ${v.headline} ===`);
+  if (v.code !== "PASSED") { console.log(v.explanation); for (const n of v.nextSteps) console.log("  -> " + n); }
+  return out;
+}
 // the whole run must finish: a hang must produce diagnostics and a failure, never a stuck job
 const WATCHDOG_MS = 25 * 60 * 1000;
 const watchdog = setTimeout(() => {
   check("e2e finished within 25 minutes", false, "watchdog fired");
-  diagnostics(); cleanup(); writeResults(); process.exit(1);
+  diagnostics(); cleanup(); writeResults(); conclude({ code: "WATCHDOG", headline: "E2E TIMED OUT (25 minutes)", explanation: "the run hung: see the last PASS line above for how far it got" }); process.exit(1);
 }, WATCHDOG_MS);
 
 try {
   // two attempts: the first start of WebView2 on a fresh runner profile can be slow or fail; the retry uses a brand-new user-data folder
-  let url = null; let verdict = null;
+  let url = null; let analysis = null;
   for (const attempt of [1, 2]) {
     launch(attempt);
-    url = await targetWs(Number(process.env[`E2E_ENDPOINT_WAIT_${attempt}`] || (attempt === 1 ? 75 : 120)));
+    url = await awaitEndpoint(Number(process.env[`E2E_ENDPOINT_WAIT_${attempt}`] || (attempt === 1 ? 75 : 120)));
     if (url) break;
-    verdict = diagnostics(`attempt ${attempt}`);
+    analysis = diagnostics(`attempt ${attempt}`);
     if (attempt === 1) { console.log("--- the debug endpoint did not come up: restarting the app once with a fresh user-data folder"); killApp(); await sleep(Number(process.env.E2E_RETRY_PAUSE_MS || 4000)); }
   }
-  if (!url) { check("WebView2 accepted the browser arguments and exposed the debug endpoint", false, `${verdict?.code}: ${verdict?.message}`); throw new Error(`WebView2 debugging endpoint never came up [${verdict?.code}]`); }
+  if (!url) {
+    startupVerdict = finalVerdict({ probe: lastProbe, analysis, appExited, appExitCode, port: PORT });
+    check("WebView2 accepted the browser arguments and exposed the debug endpoint", false, `${startupVerdict.headline}: ${startupVerdict.explanation}`);
+    throw new Error(`WebView2 debugging endpoint never came up [${startupVerdict.code}] ${startupVerdict.headline}`);
+  }
   check("WebView2 accepted the browser arguments (debug endpoint up)", true, `attempt ${attemptNo}, port ${PORT}`);
   await cdp.connect(url);
   await send("Runtime.enable"); await send("DOM.enable"); await send("Page.enable");
@@ -235,6 +261,7 @@ try {
   cleanup();
 }
 writeResults();
+conclude();
 const failed = results.filter((r) => !r.ok && r.required);
 console.log(`\n${results.filter((r) => r.ok).length}/${results.length} checks passed; required failures: ${failed.length}`);
 process.exit(failed.length ? 1 : 0);

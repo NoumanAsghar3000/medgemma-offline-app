@@ -385,6 +385,56 @@ fn every_combination_of_the_six_files_obeys_the_selection_invariants() {
     }
 }
 
+fn health_lines(inv: &Inventory) -> std::collections::HashMap<String, String> {
+    health(inv).lines.iter().filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect()
+}
+
+/// The doctor's health report: per-family readiness, how every file was identified, and every problem, in a stable KEY=VALUE format.
+#[test]
+fn the_health_report_says_exactly_what_works_and_why() {
+    // everything present
+    let (_, all) = folder("h_all", &[A8, A16, AV, B8, B16, BV]);
+    let h = health_lines(&all);
+    assert_eq!((h["HEALTH.verdict"].as_str(), h["HEALTH.family.27B"].as_str(), h["HEALTH.family.4B"].as_str(), h["HEALTH.files"].as_str()), ("OK", "ready", "ready", "6"));
+    for n in 0..6 { assert_eq!(h[&format!("HEALTH.file.{n}.state")], "ok"); assert_eq!(h[&format!("HEALTH.file.{n}.header")], "read"); }
+    // the precision of a file with a meaningless name came from the header
+    let q: Vec<(&String, &String)> = h.iter().filter(|(k, _)| k.ends_with(".quant_source")).collect();
+    assert!(q.iter().all(|(_, v)| v.as_str() == "file_type"), "{q:?}");
+    // 27B without its projector, 4B complete -> degraded, with the reason per family
+    let (_, no_av) = folder("h_noav", &[A8, B8, BV]);
+    let h = health_lines(&no_av);
+    assert_eq!((h["HEALTH.verdict"].as_str(), h["HEALTH.family.27B"].as_str(), h["HEALTH.family.4B"].as_str()), ("DEGRADED", "no-projector", "ready"));
+    // 4B weights without projector: usable but text-only
+    let (_, txt) = folder("h_txt", &[B16]);
+    let h = health_lines(&txt);
+    assert_eq!((h["HEALTH.verdict"].as_str(), h["HEALTH.family.4B"].as_str(), h["HEALTH.family.27B"].as_str()), ("DEGRADED", "text-only", "absent"));
+    // nothing usable
+    let (_, only_vision) = folder("h_vis", &[AV, BV]);
+    assert_eq!(health_lines(&only_vision)["HEALTH.verdict"], "BROKEN");
+    assert_eq!(health_lines(&Inventory::default())["HEALTH.verdict"], "EMPTY");
+}
+
+#[test]
+fn the_health_report_names_incomplete_wrong_and_unreadable_files() {
+    let d = tmp("h_bad");
+    // incomplete 4B (tensor table needs 32 MiB, file is tiny)
+    let kv = vec![("general.architecture", V::S("gemma3")), ("general.name", V::S("medgemma-selftrained")), ("gemma3.block_count", V::U(34)), ("gemma3.embedding_length", V::U(2560))];
+    write_gguf_t(&d.join("cut-off.gguf"), &kv, &[("blk.0.ffn_up.weight", &[4096, 4096], 1)]);
+    // wrong architecture
+    write_gguf(&d.join("llama.gguf"), &[("general.architecture", V::S("llama")), ("llama.block_count", V::U(62)), ("llama.embedding_length", V::U(5376))]);
+    // unreadable (>1 MiB of garbage)
+    fs::write(d.join("garbage.gguf"), vec![7u8; 2 << 20]).unwrap();
+    let inv = scan(&d).unwrap();
+    let h = health_lines(&inv);
+    assert_eq!(h["HEALTH.verdict"], "BROKEN");
+    let find = |name: &str| (0..3).find(|n| h[&format!("HEALTH.file.{n}.name")] == name).unwrap();
+    let (a, b, c) = (find("cut-off.gguf"), find("llama.gguf"), find("garbage.gguf"));
+    assert!(h[&format!("HEALTH.file.{a}.detail")].contains("INCOMPLETE")); assert_eq!(h[&format!("HEALTH.file.{a}.state")], "bad");
+    assert!(h[&format!("HEALTH.file.{b}.detail")].contains("not a Gemma 3")); assert_eq!(h[&format!("HEALTH.file.{b}.state")], "bad");
+    assert_eq!(h[&format!("HEALTH.file.{c}.header")], "unreadable"); assert!(h[&format!("HEALTH.file.{c}.detail")].contains("cannot read the GGUF header"));
+    assert_eq!(h["HEALTH.family.4B"], "broken");
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // GPU planning through the REAL prepare_with (the function the app calls). Needs real multi-GB file sizes, which are only
 // cheap as sparse files, so these run on the Linux job (NTFS would reserve the space).

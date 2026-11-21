@@ -34,7 +34,8 @@ export function parseDevToolsActivePort(text) {
 export function analyzeBrowserArgs(commandLines, port) {
   const lines = String(commandLines ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const web = lines.filter((l) => /msedgewebview2/i.test(l));
-  const hasPort = web.some((l) => l.includes(`--remote-debugging-port=${port}`));
+  const portFlag = new RegExp(`--remote-debugging-port=${String(port).replace(/[^0-9]/g, "")}(?![0-9])`);   // the whole number: 933 must not match 9333
+  const hasPort = web.some((l) => portFlag.test(l));
   const hasFakeDevice = web.some((l) => l.includes("--use-fake-device-for-media-stream"));
   const hasFakeUi = web.some((l) => l.includes("--use-fake-ui-for-media-stream"));
   let code, message;
@@ -50,4 +51,39 @@ export function analyzeBrowserArgs(commandLines, port) {
     message = `--remote-debugging-port=${port} reached the browser process but nothing listens on it: the port may be blocked, or remote debugging is disabled by a Windows policy (RemoteDebuggingAllowed).`;
   }
   return { code, message, webviewProcesses: web.length, hasPort, hasFakeDevice, hasFakeUi };
+}
+
+/**
+ * The single plain-language verdict of a startup that did not reach a DevTools page. Combines what the port answered (probe, from cdp.mjs
+ * probeEndpoint/waitForEndpoint), what the process command lines show (analyzeBrowserArgs) and whether the app is still alive.
+ * headline is what a human reads first: DEBUG PORT NOT DETECTED | WEBVIEW2 ARGS NOT APPLIED | WEBVIEW2 DID NOT START | APP EXITED ... | ...
+ */
+export function finalVerdict({ probe, analysis, appExited = false, appExitCode = null, port }) {
+  const state = probe?.state;
+  if (state === "ok") return { code: "OK", headline: "DEBUG PORT OK", explanation: `a DevTools page target answered on port ${port}`, nextSteps: [] };
+  if (appExited) {
+    return { code: "APP_EXITED", headline: "APP EXITED BEFORE THE DEBUG PORT OPENED", explanation: `the app process ended (exit code ${appExitCode}) before WebView2 exposed a debug port`,
+      nextSteps: ["Read app.log (the app's own output).", "Start the installed exe by hand and see whether the window opens.", "Look for a crash entry in Windows Event Viewer > Windows Logs > Application."] };
+  }
+  if (state === "http-error" || state === "not-json") {
+    return { code: "PORT_TAKEN", headline: "DEBUG PORT BELONGS TO ANOTHER PROGRAM", explanation: `port ${port} answers, but not as a DevTools endpoint: ${probe.detail}`,
+      nextSteps: [`Free port ${port} or let the test choose another one (it normally does).`] };
+  }
+  if (state === "no-page-target") {
+    return { code: "NO_PAGE", headline: "DEBUG PORT OPEN, BUT NO PAGE", explanation: probe.detail, nextSteps: ["The WebView2 window was not created: read app.log and check that create_main_window() ran (tauri.conf.json has \"create\": false)."] };
+  }
+  const flagWarning = analysis && analysis.hasPort && !(analysis.hasFakeDevice && analysis.hasFakeUi) ? " The fake-camera flags are missing from the browser process too." : "";
+  if (analysis?.code === "NO_WEBVIEW2") {
+    return { code: "NO_WEBVIEW2", headline: "WEBVIEW2 DID NOT START", explanation: analysis.message,
+      nextSteps: ["Check that the WebView2 runtime is installed (Evergreen standalone).", "Check app.log.", "Make sure no other instance holds the user-data folder."] };
+  }
+  if (analysis?.code === "ARGS_NOT_ACCEPTED") {
+    return { code: "ARGS_NOT_ACCEPTED", headline: "WEBVIEW2 ARGS NOT APPLIED", explanation: analysis.message,
+      nextSteps: ["Confirm the installed exe is the build that contains create_main_window() with MG_TEST_BROWSER_ARGS (src-tauri/src/main.rs).",
+        "Confirm tauri.conf.json has \"create\": false for the main window.", "Look at the command lines above: they show the arguments WebView2 really received.",
+        "A different user-data folder is used for each attempt; if both attempts fail the arguments are being dropped by the app or the runtime."] };
+  }
+  return { code: analysis?.code === "FLAG_PRESENT_NO_LISTENER" ? "FLAG_PRESENT_NO_LISTENER" : "PORT_CLOSED", headline: "DEBUG PORT NOT DETECTED",
+    explanation: `${probe?.detail ?? "nothing answered"} (probe results: ${JSON.stringify(probe?.tally ?? {})}).${analysis ? " " + analysis.message : " (the process command lines could not be read here)"}${flagWarning}`,
+    nextSteps: [`Check that port ${port} is not blocked by a firewall or a Windows policy (RemoteDebuggingAllowed).`, "Check DevToolsActivePort in the user-data folder: if it is missing, remote debugging never started."] };
 }

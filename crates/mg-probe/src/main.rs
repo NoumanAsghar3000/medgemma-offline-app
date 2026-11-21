@@ -1,6 +1,7 @@
 //! CLI used by the Inno Setup wizard. Writes simple KEY=VALUE lines to `--out`.
 //!   mg-probe hw   --out f
 //!   mg-probe plan --dir D --compute cpu|gpu --out f
+//!   mg-probe doctor --dir D [--compute cpu|gpu]      human report + a machine-readable HEALTH block (HEALTH.verdict=OK|DEGRADED|BROKEN|EMPTY)
 //! (A GUI-subsystem build would avoid console flashes, but Inno runs it with SW_HIDE.)
 use mg_core::{bench, hw, plan, select, GIB, HEADROOM, MIN_TOTAL_RAM};
 use std::{fmt::Write as _, path::Path};
@@ -30,6 +31,11 @@ fn main() {
             match select::scan(Path::new(&dir)) {
                 Err(e) => { let _ = writeln!(s, "\nCANNOT READ THE FOLDER: {e}"); }
                 Ok(inv) => {
+                    // Machine-readable health (parsed by tools/doctor.mjs): which family works, how each file was identified, every problem.
+                    let health = select::health(&inv);
+                    let _ = writeln!(s, "\n--- HEALTH (machine readable) ---");
+                    for l in &health.lines { let _ = writeln!(s, "{l}"); }
+                    let _ = writeln!(s, "--- END HEALTH ---");
                     let _ = writeln!(s, "\nFiles found ({}):", inv.files.len());
                     let mut files: Vec<_> = inv.files.iter().collect(); files.sort_by_key(|f| f.path.clone());
                     for f in files {

@@ -37,6 +37,8 @@ pub struct GgufFile {
     pub quant: String,
     pub is_mmproj: bool,
     pub text_only: bool,
+    /// Where the precision label came from: "name" (a tag in the file name), "file_type" / "tensors" (the header: authoritative), "unknown".
+    pub quant_source: &'static str,
     /// Header metadata read from the real file (None for fake paths in tests / unreadable files).
     pub info: Option<gguf::GgufInfo>,
     /// Set when the file is unusable (wrong architecture, mismatched vision projector ...); such files are skipped and reported.
@@ -93,6 +95,7 @@ pub fn classify(path: &Path, size: u64) -> Option<GgufFile> {
         path: path.to_path_buf(), size, family, quant,
         is_mmproj: lower.contains("mmproj"),
         text_only: has_word(&lower, "text"),
+        quant_source: if QUANTS.iter().any(|q| upper.contains(*q)) { "name" } else { "unknown" },
         info: None, problem: None, warnings: vec![],
     })
 }
@@ -145,7 +148,10 @@ pub fn enrich(inv: &mut Inventory) {
                 // CONTENT WINS over the file name / folder. 8-bit vs 16-bit: the header's file type is authoritative for the exact
                 // tags (F32 / F16 / BF16 / Q8_0); other quantization tags keep the name's more specific label (e.g. Q8_K_XL).
                 if let Some(q) = i.quant_name() {
-                    if f.quant == "unknown" || matches!(q, "F32" | "F16" | "BF16" | "Q8_0") { f.quant = q.to_string(); }
+                    if f.quant == "unknown" || matches!(q, "F32" | "F16" | "BF16" | "Q8_0") {
+                        f.quant = q.to_string();
+                        f.quant_source = if i.file_type.and_then(gguf::ftype_name).is_some() { "file_type" } else { "tensors" };
+                    }
                 }
                 // family: real Gemma-3 geometry (62 layers / 5376 wide = 27B, 34 layers / 2560 wide = 4B; projector width for mmproj files)
                 if let Some(g) = i.family_guess() {
@@ -310,6 +316,84 @@ pub fn choose(inv: &Inventory, mc: &Machine) -> Result<Plan, SelectError> {
 pub fn plan_for(inv: &Inventory, file_name: &str, mc: &Machine) -> Option<Plan> {
     variants(inv, mc).into_iter().find(|p| p.model.file_name().map(|n| n.to_string_lossy() == file_name).unwrap_or(false))
         .map(|mut p| { p.forced = p.placement.tps_worst < plan::MIN_TPS; p })
+}
+
+
+/// Readiness of one family, judged from the FILES alone (not from this PC's memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FamilyHealth {
+    /// weights + (for 27B required, for 4B optional) matching projector, no problems
+    Ready,
+    /// 4B weights without a projector: usable, text only
+    TextOnly,
+    /// 27B weights found but no projector that matches: 27B cannot be used
+    NoProjector,
+    /// no weights for this family in the folder
+    Absent,
+    /// weights exist but every one of them has a problem (incomplete, wrong architecture, unreadable ...)
+    Broken,
+}
+impl FamilyHealth {
+    pub fn label(&self) -> &'static str {
+        match self { FamilyHealth::Ready => "ready", FamilyHealth::TextOnly => "text-only", FamilyHealth::NoProjector => "no-projector", FamilyHealth::Absent => "absent", FamilyHealth::Broken => "broken" }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthVerdict { Empty, Broken, Degraded, Ok }
+impl HealthVerdict {
+    pub fn label(&self) -> &'static str { match self { HealthVerdict::Empty => "EMPTY", HealthVerdict::Broken => "BROKEN", HealthVerdict::Degraded => "DEGRADED", HealthVerdict::Ok => "OK" } }
+}
+
+#[derive(Debug, Clone)]
+pub struct Health { pub verdict: HealthVerdict, pub g27: FamilyHealth, pub g4: FamilyHealth, pub lines: Vec<String> }
+
+fn family_health(inv: &Inventory, fam: Family) -> FamilyHealth {
+    let weights: Vec<&GgufFile> = inv.files.iter().filter(|f| !f.is_mmproj && f.family == Some(fam) && !f.text_only).collect();
+    if weights.is_empty() { return FamilyHealth::Absent; }
+    if weights.iter().all(|f| f.problem.is_some()) { return FamilyHealth::Broken; }
+    match (best_mmproj(inv, fam).is_some(), fam) {
+        (true, _) => FamilyHealth::Ready,
+        (false, Family::G27) => FamilyHealth::NoProjector,
+        (false, Family::G4) => FamilyHealth::TextOnly,
+    }
+}
+
+/// KEY=VALUE health report of a model folder (printed by `mg-probe doctor`, parsed by tools/doctor.mjs): which family works, how every
+/// file was identified (header or name), and every problem. Judges the FILES only; speed/memory is the planner's job.
+pub fn health(inv: &Inventory) -> Health {
+    let g27 = family_health(inv, Family::G27); let g4 = family_health(inv, Family::G4);
+    let mut lines = vec![];
+    let mut files: Vec<&GgufFile> = inv.files.iter().collect(); files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut any_issue = false;
+    for (n, f) in files.iter().enumerate() {
+        let name = f.path.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        let (state, detail) = match (&f.problem, f.warnings.is_empty()) {
+            (Some(p), _) => { any_issue = true; ("bad", p.clone()) }
+            (None, false) => { any_issue = true; ("warning", f.warnings.join("; ")) }
+            (None, true) => ("ok", String::new()),
+        };
+        lines.push(format!("HEALTH.file.{n}.name={name}"));
+        lines.push(format!("HEALTH.file.{n}.kind={}", if f.is_mmproj { "projector" } else if f.text_only { "text-only-weights" } else { "weights" }));
+        lines.push(format!("HEALTH.file.{n}.family={}", f.family.map(|x| x.label()).unwrap_or("unknown")));
+        lines.push(format!("HEALTH.file.{n}.quant={}", f.quant));
+        lines.push(format!("HEALTH.file.{n}.quant_source={}", f.quant_source));
+        lines.push(format!("HEALTH.file.{n}.size={}", f.size));
+        lines.push(format!("HEALTH.file.{n}.expected_min_size={}", f.info.as_ref().and_then(|i| i.expected_min_size).map(|x| x.to_string()).unwrap_or_else(|| "-".into())));
+        lines.push(format!("HEALTH.file.{n}.header={}", if f.info.is_some() { "read" } else { "unreadable" }));
+        lines.push(format!("HEALTH.file.{n}.state={state}"));
+        if !detail.is_empty() { lines.push(format!("HEALTH.file.{n}.detail={detail}")); }
+    }
+    let usable = |h: &FamilyHealth| matches!(h, FamilyHealth::Ready | FamilyHealth::TextOnly);
+    let verdict = if inv.files.is_empty() { HealthVerdict::Empty }
+        else if !usable(&g27) && !usable(&g4) { HealthVerdict::Broken }
+        else if any_issue || matches!(g27, FamilyHealth::NoProjector | FamilyHealth::Broken) || matches!(g4, FamilyHealth::TextOnly | FamilyHealth::Broken) { HealthVerdict::Degraded }
+        else { HealthVerdict::Ok };
+    lines.insert(0, format!("HEALTH.family.4B={}", g4.label()));
+    lines.insert(0, format!("HEALTH.family.27B={}", g27.label()));
+    lines.insert(0, format!("HEALTH.verdict={}", verdict.label()));
+    lines.insert(1, format!("HEALTH.files={}", inv.files.len()));
+    Health { verdict, g27, g4, lines }
 }
 
 #[cfg(test)]

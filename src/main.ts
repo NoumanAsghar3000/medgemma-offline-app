@@ -150,6 +150,11 @@ const cam = new CameraSession({
   showStream: (s) => { $<HTMLVideoElement>("video").srcObject = s; },
   get video() { return $<HTMLVideoElement>("video"); },
 });
+// Read-only diagnostics for support and for tools/doctor.mjs (read over the debug port): camera session state + backend status. No images, no patient data.
+Object.defineProperty(window, "__mgDiagnostics", {
+  value: () => ({ camera: cam.diagnose(), backend: st ? { state: st.state, model: st.model_file, quant: st.quant, family: st.family, compute: st.compute, multimodal: st.multimodal, note: st.note } : null }),
+  enumerable: false,
+});
 $("m-cam").onclick = () => { void cam.open(); };       // constraint ladder, readiness gating, disconnect handling: see src/camera.ts
 $("cam-cancel").onclick = () => cam.close();
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && cam.visible) cam.close(); });
