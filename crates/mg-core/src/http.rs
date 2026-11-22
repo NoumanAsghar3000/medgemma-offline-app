@@ -8,6 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Bounds for what the server may send back. A real llama-server never comes close; anything else listening on the port is not it.
+const MAX_HEAD: usize = 64 * 1024;
+const MAX_CHUNK: usize = 64 * 1024 * 1024;
+const MAX_LINE: usize = 16 * 1024 * 1024;
+const MAX_ERR_BODY: usize = 4096;
+
 /// POST `body` (JSON) to /v1/chat/completions and call `on_event` with every SSE `data:` payload
 /// (JSON text or "[DONE]"). Handles chunked transfer-encoding. Returns Err on HTTP/connection errors.
 pub fn post_sse(port: u16, token: &str, body: &str, cancel: &AtomicBool, mut on_event: impl FnMut(String)) -> Result<(), String> {
@@ -49,7 +55,10 @@ pub fn post_sse(port: u16, token: &str, body: &str, cancel: &AtomicBool, mut on_
                 status = head.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
                 chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
                 raw.drain(..p + 4); headers_done = true;
-            } else { continue; }
+            } else {
+                if raw.len() > MAX_HEAD { return Err("The model server sent an invalid response.".into()); }
+                continue;
+            }
         }
         // de-chunk
         if chunked {
@@ -58,6 +67,7 @@ pub fn post_sse(port: u16, token: &str, body: &str, cancel: &AtomicBool, mut on_
                 let size_str = String::from_utf8_lossy(&raw[..p]).to_string();
                 let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
                 if size == 0 { done = true; raw.clear(); break; }
+                if size > MAX_CHUNK { return Err("The model server sent an oversized response chunk.".into()); }
                 if raw.len() < p + 2 + size + 2 { break; }          // wait for the whole chunk
                 decoded.extend_from_slice(&raw[p + 2..p + 2 + size]);
                 raw.drain(..p + 2 + size + 2);
@@ -68,9 +78,12 @@ pub fn post_sse(port: u16, token: &str, body: &str, cancel: &AtomicBool, mut on_
         for b in decoded.drain(..) {
             if b == b'\n' {
                 let line = String::from_utf8_lossy(&line_buf).trim().to_string(); line_buf.clear();
-                if status != 200 { err_body.push_str(&line); continue; }
+                if status != 200 { if err_body.len() < MAX_ERR_BODY { err_body.push_str(&line); } continue; }
                 if let Some(d) = line.strip_prefix("data:") { on_event(d.trim().to_string()); }
-            } else { line_buf.push(b); }
+            } else {
+                if line_buf.len() >= MAX_LINE { return Err("The model server sent an oversized response line.".into()); }
+                line_buf.push(b);
+            }
         }
     }
     if status != 200 {
@@ -124,6 +137,18 @@ pub(crate) mod tests {
         let port = serve(vec![format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()]);
         let e = post_sse(port, "t", "{}", &AtomicBool::new(false), |_| {}).unwrap_err();
         assert!(e.contains("400") && e.contains("bad image"), "{e}");
+    }
+    #[test] fn hostile_chunk_size_is_refused_instead_of_overflowing() {
+        // 0xFFFFFFFFFFFFFFFF would overflow `p + 2 + size + 2` (a wrap in release builds, which use panic=abort = app crash)
+        let port = serve(vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nx".to_vec()]);
+        let e = post_sse(port, "t", "{}", &AtomicBool::new(false), |_| {}).unwrap_err();
+        assert!(e.contains("oversized"), "{e}");
+    }
+    #[test] fn endless_header_is_refused() {
+        let mut junk = b"HTTP/1.1 200 OK\r\nX-Junk: ".to_vec(); junk.extend(vec![b'a'; MAX_HEAD + 4096]);
+        let port = serve(vec![junk]);
+        let e = post_sse(port, "t", "{}", &AtomicBool::new(false), |_| {}).unwrap_err();
+        assert!(e.contains("invalid response"), "{e}");
     }
     #[test] fn plain_non_chunked_stream() {
         let port = serve(vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"x\":1}\n\ndata: [DONE]\n\n".to_vec()]);

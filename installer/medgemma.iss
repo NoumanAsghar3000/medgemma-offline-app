@@ -75,10 +75,18 @@ Name: "{group}\Uninstall MedGemma Offline"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\MedGemma Offline"; Filename: "{app}\medgemma-offline.exe"; Tasks: desktopicon
 
 [Run]
+; OS-level enforcement of "offline": the inference engine gets NO network access (outbound blocked in Windows Firewall). Loopback traffic is not
+; filtered by Windows Firewall, so the app can still talk to its own engine on 127.0.0.1. The rule is removed again on uninstall.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MedGemma Offline engine (no network)"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MedGemma Offline engine (no network)"" dir=out action=block enable=yes profile=any program=""{app}\backend\cpu\llama-server.exe"""; Flags: runhidden waituntilterminated; StatusMsg: "Blocking network access for the inference engine..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MedGemma Offline engine (no network)"" dir=out action=block enable=yes profile=any program=""{app}\backend\vulkan\llama-server.exe"""; Flags: runhidden waituntilterminated; Check: GpuSelected
 #ifdef BundleWebView2
 Filename: "{tmp}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; Parameters: "/silent /install"; StatusMsg: "Installing Microsoft WebView2 runtime (offline)..."; Check: NeedsWebView2; Flags: waituntilterminated
 #endif
 Filename: "{app}\medgemma-offline.exe"; Description: "Launch MedGemma Offline"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MedGemma Offline engine (no network)"""; Flags: runhidden; RunOnceId: "RemoveEngineFirewallRule"
 
 [UninstallDelete]
 ; files created AFTER installation (so Inno does not know them). Your model folder is never touched.
@@ -102,6 +110,7 @@ var
   Hw, Plan: TStringList;
   ProbeReady: Boolean;
   ComputeOk, ModelOk: Boolean;
+  AppDirIsOurs: Boolean;
 
 { ---------- helpers ---------- }
 { Inno's TStringList has no Values[] property: look up KEY=VALUE lines ourselves }
@@ -390,6 +399,44 @@ begin
 #endif
 end;
 
+{ ---------- install-folder permissions ---------- }
+{ The default folder is C:\MedGemmaOffline. Folders created directly under a drive root inherit "Authenticated Users: Modify", so after an
+  admin install ANY standard user could replace medgemma-offline.exe, llama-server.exe or its DLLs, or edit install.json, and have that code
+  run under another user's account (local privilege escalation). We therefore reset the permissions of OUR folder to SYSTEM + Administrators
+  full control and Users read/execute. A pre-existing foreign folder (for example D:\Tools) is never re-permissioned: only a folder that
+  this installer creates, or that already holds a previous install of this app, is locked down. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  D: String;
+begin
+  Result := '';
+  D := AddBackslash(WizardDirValue);
+  AppDirIsOurs := (not DirExists(D)) or FileExists(D + 'medgemma-offline.exe');
+end;
+
+procedure LockDownAppDir;
+var
+  Dir: String;
+  Rc: Integer;
+begin
+  Dir := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
+  Rc := -1;
+  if (Length(Dir) <= 3) or (not AppDirIsOurs) then
+  begin
+    Log('SECURITY: permissions of ' + Dir + ' were left unchanged (drive root or a folder that existed before this install)');
+    if not WizardSilent then
+      MsgBox('The install folder already existed, so its permissions were not changed. For best security install into a new folder, ' +
+             'for example under C:\Program Files, so that only administrators can modify the program files.', mbInformation, MB_OK);
+    Exit;
+  end;
+  if Exec(ExpandConstant('{sys}\icacls.exe'),
+       QuoteArg(Dir) + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q',
+       '', SW_HIDE, ewWaitUntilTerminated, Rc) and (Rc = 0) then
+    Log('SECURITY: install folder locked down (SYSTEM + Administrators full control, Users read/execute)')
+  else
+    Log('SECURITY WARNING: could not restrict permissions on ' + Dir + ' (icacls exit code ' + IntToStr(Rc) + ')');
+end;
+
 { ---------- after files are copied: write config, optionally copy model ---------- }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
@@ -415,7 +462,7 @@ begin
       if Src = '' then Continue;
       WizardForm.StatusLabel.Caption := 'Copying ' + ExtractFileName(Src) + ' (this can take several minutes)...';
       WizardForm.StatusLabel.Update;
-      if not Exec(ExpandConstant('{cmd}'), '/C copy /Y ' + QuoteArg(Src) + ' ' + QuoteArg(Dst + '\'), '', SW_HIDE, ewWaitUntilTerminated, Rc) or (Rc <> 0) then
+      if not FileCopy(Src, AddBackslash(Dst) + ExtractFileName(Src), False) then
       begin
         MsgBox('Copying ' + ExtractFileName(Src) + ' failed (not enough disk space?). The app will use the files in place instead.', mbError, MB_OK);
         Dst := '';
@@ -431,6 +478,7 @@ begin
   SetArrayLength(Json, 1);
   Json[0] := '{ "compute": "' + ComputeName + '", "model_dir": "' + Esc + '" }';
   SaveStringsToUTF8File(ExpandConstant('{app}\install.json'), Json, False);
+  LockDownAppDir;
 end;
 
 procedure DeinitializeSetup;

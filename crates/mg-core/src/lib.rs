@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bench;
 pub mod config;
 pub mod gguf;
+pub mod guard;
 pub mod http;
 pub mod plan;
 pub mod hw;

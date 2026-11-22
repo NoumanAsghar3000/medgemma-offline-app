@@ -12,6 +12,9 @@ const SYSTEM = "You are MedGemma, a careful medical AI assistant supporting clin
   "Describe what you actually see before interpreting it, never invent findings that are not visible or stated, and say clearly when image quality or missing data limits the conclusion. " +
   "For ordinary questions without clinical material, answer normally. You are decision support only; the clinician decides.";
 
+/** File names come from outside: keep them to one printable line so a name cannot fake extra prompt structure. */
+const promptName = (n: string) => n.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/-{3,}/g, "-").trim().slice(0, 120);
+
 /** Build the OpenAI-style message list. Older turns are text-only and trimmed to fit the context window. */
 export function buildMessages(history: Turn[], text: string, atts: Att[], ctx: number) {
   const nImg = atts.reduce((n, a) => n + a.images.length, 0);
@@ -22,7 +25,7 @@ export function buildMessages(history: Turn[], text: string, atts: Att[], ctx: n
   for (const a of atts.filter((x) => x.text)) {
     let t = a.text.trim();
     if (t.length > docChars) t = t.slice(0, Math.max(0, docChars)) + "\n[... truncated to fit the model's context window ...]";
-    docs += `\n\n--- Attached file: ${a.name} ---\n${t}`; docChars -= t.length;
+    docs += `\n\n--- Attached file: ${promptName(a.name)} ---\n${t}`; docChars -= t.length;
     if (docChars <= 0) break;
   }
   const parts: Part[] = [{ type: "text", text: (text || "Please analyse the attached material.") + docs }];

@@ -2,7 +2,7 @@
 //! Native shell. Owns: config, model-folder validation/re-link, lifecycle of the local llama.cpp server,
 //! the chat proxy (webview -> Rust -> loopback server), idle unloading ("memory modes") and PDF saving.
 //! All hardware/model decisions live in `mg-core` (shared with the installer helper `mg-probe`).
-use mg_core::{backend, config::Config, hw, http};
+use mg_core::{backend, config::Config, guard, hw, http};
 use serde::Serialize;
 use std::{
     path::PathBuf,
@@ -53,9 +53,12 @@ fn load_cfg(app: &AppHandle) -> Config {
     // user config (written when the folder is re-linked / memory mode changed) wins over the installer's seed
     Config::load(&user_cfg(app)).or_else(|| Config::load(&exe_dir().join("install.json"))).unwrap_or_default()
 }
-fn token() -> String {
-    let mut b = [0u8; 16]; let _ = getrandom::getrandom(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect()
+/// Per-session server key. Fails CLOSED: if the OS cannot supply randomness the engine is not started (an ignored error here used to
+/// leave an all-zero, guessable key).
+fn token() -> Result<String, String> {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 fn publish(app: &AppHandle, s: Status) {
     app.state::<AppState>().inner.lock().unwrap().status = s.clone();
@@ -97,7 +100,10 @@ fn bootstrap(app: AppHandle) {
         s.message = format!("Loading {} ({}). Weights are read lazily from disk - a large model can take a few minutes from a USB drive.", s.family, s.quant);
         publish(&app, s.clone());
 
-        let tok = token();
+        let tok = match token() {
+            Ok(t) => t,
+            Err(e) => { s.state = "error".into(); s.message = format!("Could not create a secure session key ({e}). The model server was not started."); return publish(&app, s); }
+        };
         let log = app.path().app_log_dir().unwrap_or_else(|_| exe_dir()).join("backend.log");
         match backend::start_ready(&plan, compute, &exe_dir(), &log, &tok, &cancel, Duration::from_secs(30 * 60)) {
             Ok(l) => {
@@ -205,6 +211,8 @@ fn set_memory_mode(app: AppHandle, minutes: u32) -> Result<(), String> {
 /// pushed to the UI through `on_event`. The server key and port never reach the webview.
 #[tauri::command(async)]
 fn chat_stream(app: AppHandle, body: String, on_event: Channel<String>) -> Result<(), String> {
+    // The webview is not trusted to talk to the engine directly: only the allow-listed request shape gets through (see mg_core::guard).
+    let body = guard::sanitize_chat_body(&body)?;
     let st = app.state::<AppState>();
     let (port, tok) = {
         let g = st.inner.lock().unwrap();
@@ -233,17 +241,23 @@ fn chat_stream(app: AppHandle, body: String, on_event: Channel<String>) -> Resul
 fn chat_cancel(state: State<AppState>) { state.chat_cancel.store(true, Ordering::SeqCst); }
 
 /// Native "Save as" + write. (Browser-style <a download> is unreliable inside WebView2.)
+/// Only a PDF is ever written, the file name offered is a bare `*.pdf` name, and the saved file always ends in `.pdf`.
 #[tauri::command(async)]
 fn save_report(app: AppHandle, filename: String, data_b64: String) -> Result<Option<String>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    let bytes = STANDARD.decode(data_b64).map_err(|e| e.to_string())?;
+    if data_b64.len() > guard::MAX_REPORT_BYTES / 3 * 4 + 8 { return Err("The report is too large.".into()); }
+    let bytes = STANDARD.decode(data_b64).map_err(|_| "The report data is not valid.".to_string())?;
+    guard::check_report_bytes(&bytes)?;
     // CI-only hook (never set for users): the native Save dialog cannot be clicked by the headless end-to-end test.
-    let path = if let Ok(t) = std::env::var("MG_TEST_SAVE_PATH") { PathBuf::from(t) } else {
-        let Some(p) = app.dialog().file().set_title("Save medical report").set_file_name(filename).add_filter("PDF document", &["pdf"]).blocking_save_file() else {
+    let mut path = if let Ok(t) = std::env::var("MG_TEST_SAVE_PATH") { PathBuf::from(t) } else {
+        let Some(p) = app.dialog().file().set_title("Save medical report").set_file_name(guard::safe_report_name(&filename)).add_filter("PDF document", &["pdf"]).blocking_save_file() else {
             return Ok(None);
         };
         p.into_path().map_err(|e| e.to_string())?
     };
+    if !path.extension().map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false) {
+        let mut os = path.into_os_string(); os.push(".pdf"); path = PathBuf::from(os);
+    }
     std::fs::write(&path, bytes).map_err(|e| format!("Could not write the file: {e}"))?;
     Ok(Some(path.display().to_string()))
 }
@@ -257,7 +271,8 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
     let builder = tauri::WebviewWindowBuilder::from_config(app, &cfg)?;
     #[cfg(windows)]
     let builder = match std::env::var("MG_TEST_BROWSER_ARGS") {
-        Ok(a) if !a.trim().is_empty() => builder.additional_browser_args(&a),
+        // only the exact Chromium flags the test suite needs are honoured (see guard::allowed_test_browser_args)
+        Ok(a) if !guard::allowed_test_browser_args(&a).is_empty() => builder.additional_browser_args(&guard::allowed_test_browser_args(&a)),
         _ => builder,
     };
     builder.build()?;

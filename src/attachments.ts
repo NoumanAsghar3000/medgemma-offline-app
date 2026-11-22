@@ -5,6 +5,7 @@ import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import mammoth from "mammoth/mammoth.browser";
 import UTIF from "utif";
 import { summarizeCsv } from "./csv";
+import { declaredZipBytes } from "./zipguard";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -14,6 +15,9 @@ const MAX_IMG = 1024;          // longest side sent to the vision encoder (Gemma
 const MAX_PDF_IMG_PAGES = 6;   // scanned pages rendered as images (each costs ~256 tokens)
 const MAX_PDF_PAGES = 60;
 const MAX_FILE_BYTES = 120 * 1024 * 1024;
+// Attachments are untrusted input. These caps keep a hostile file from freezing or crashing the window (memory / CPU exhaustion).
+const MAX_PIXELS = 100_000_000;                 // ~10 000 x 10 000: a decoded RGBA canvas of this size is already 400 MB
+const MAX_DOCX_INFLATED = 200 * 1024 * 1024;     // total uncompressed size a .docx may declare
 
 function canvasToJpeg(c: HTMLCanvasElement): string { return c.toDataURL("image/jpeg", 0.88); }
 function fit(w: number, h: number): [number, number] { const k = Math.min(1, MAX_IMG / Math.max(w, h)); return [Math.round(w * k), Math.round(h * k)]; }
@@ -22,7 +26,11 @@ async function imageToJpeg(file: File): Promise<string> {
   const ext = file.name.toLowerCase().split(".").pop() ?? "";
   if (ext === "tif" || ext === "tiff" || file.type === "image/tiff") {
     const buf = await file.arrayBuffer();
-    const ifds = UTIF.decode(buf); UTIF.decodeImage(buf, ifds[0]);
+    const ifds = UTIF.decode(buf);
+    if (!ifds.length) throw new Error("not a readable TIFF image");
+    const tw = Number(ifds[0].t256?.[0] ?? 0), th = Number(ifds[0].t257?.[0] ?? 0);      // width / height tags, read before anything is allocated
+    if (!(tw > 0 && th > 0) || tw * th > MAX_PIXELS) throw new Error("image dimensions are too large");
+    UTIF.decodeImage(buf, ifds[0]);
     const rgba = UTIF.toRGBA8(ifds[0]);
     const src = document.createElement("canvas"); src.width = ifds[0].width; src.height = ifds[0].height;
     src.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(rgba), src.width, src.height), 0, 0);
@@ -32,6 +40,7 @@ async function imageToJpeg(file: File): Promise<string> {
     const j = canvasToJpeg(out); src.width = src.height = out.width = out.height = 0; return j;
   }
   const bmp = await createImageBitmap(file);
+  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error("image dimensions are too large"); }
   const [w, h] = fit(bmp.width, bmp.height);
   const c = document.createElement("canvas"); c.width = w; c.height = h;
   const g = c.getContext("2d")!; g.fillStyle = "#fff"; g.fillRect(0, 0, w, h); g.drawImage(bmp, 0, 0, w, h);
@@ -41,7 +50,7 @@ async function imageToJpeg(file: File): Promise<string> {
 }
 
 async function readPdf(file: File): Promise<{ text: string; images: string[]; warn: string }> {
-  const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;   // no eval()/Function for fonts: a hostile PDF cannot reach it
   const n = Math.min(doc.numPages, MAX_PDF_PAGES);
   let text = ""; const images: string[] = []; let skipped = 0;
   for (let p = 1; p <= n; p++) {
@@ -78,7 +87,9 @@ export async function processFile(file: File): Promise<Att> {
       const r = await readPdf(file); a.text = r.text; a.images = r.images; a.warn = r.warn; a.thumb = r.images[0] ?? ""; a.label = "PDF";
       if (!a.text && !a.images.length) a.warn = "no readable content found";
     } else if (ext === "docx") {
-      a.text = (await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })).value; a.label = "DOCX";
+      const buf = await file.arrayBuffer();
+      if (declaredZipBytes(buf) > MAX_DOCX_INFLATED) { a.warn = "this .docx is not safe to open (it would expand to an unreasonable size)"; a.label = "DOCX"; return a; }
+      a.text = (await mammoth.extractRawText({ arrayBuffer: buf })).value; a.label = "DOCX";
     } else if (TEXT_EXT.has(ext) || file.type.startsWith("text/")) {
       a.text = await file.text(); a.label = ext.toUpperCase() || "TXT";
       if (ext === "csv" || ext === "tsv") a.text = summarizeCsv(a.text);
