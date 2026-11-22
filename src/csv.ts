@@ -26,7 +26,9 @@ export function summarizeCsv(text: string, sampleRows = 30, fullBelowChars = 600
     const nums: number[] = [];
     for (const r of body) { const v = parseFloat((r[c] ?? "").replace(",", ".")); if (Number.isFinite(v) && /^[\s\-+.\d,eE%]+$/.test(r[c] ?? "")) nums.push(v); }
     if (nums.length >= Math.max(3, body.length * 0.6)) {
-      const min = Math.min(...nums), max = Math.max(...nums), mean = nums.reduce((a, b) => a + b, 0) / nums.length;
+      let min = Infinity, max = -Infinity, sum = 0;           // plain loop: Math.min(...nums) throws "Maximum call stack size exceeded" for ~125k+ values
+      for (const v of nums) { if (v < min) min = v; if (v > max) max = v; sum += v; }
+      const mean = sum / nums.length;
       stats.push(`${h.trim()}: n=${nums.length}, min=${+min.toFixed(3)}, max=${+max.toFixed(3)}, mean=${+mean.toFixed(3)}`);
     }
   });

@@ -18,6 +18,7 @@ const MAX_FILE_BYTES = 120 * 1024 * 1024;
 // Attachments are untrusted input. These caps keep a hostile file from freezing or crashing the window (memory / CPU exhaustion).
 const MAX_PIXELS = 100_000_000;                 // ~10 000 x 10 000: a decoded RGBA canvas of this size is already 400 MB
 const MAX_DOCX_INFLATED = 200 * 1024 * 1024;     // total uncompressed size a .docx may declare
+const MAX_TEXT_BYTES = 4 * 1024 * 1024;           // plain text beyond this is cut (the prompt only has room for a few tens of KB anyway)
 
 function canvasToJpeg(c: HTMLCanvasElement): string { return c.toDataURL("image/jpeg", 0.88); }
 function fit(w: number, h: number): [number, number] { const k = Math.min(1, MAX_IMG / Math.max(w, h)); return [Math.round(w * k), Math.round(h * k)]; }
@@ -51,27 +52,33 @@ async function imageToJpeg(file: File): Promise<string> {
 
 async function readPdf(file: File): Promise<{ text: string; images: string[]; warn: string }> {
   const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;   // no eval()/Function for fonts: a hostile PDF cannot reach it
-  const n = Math.min(doc.numPages, MAX_PDF_PAGES);
-  let text = ""; const images: string[] = []; let skipped = 0;
-  for (let p = 1; p <= n; p++) {
-    const page = await doc.getPage(p);
-    const tc = await page.getTextContent();
-    const t = tc.items.map((i) => ("str" in i ? i.str : "")).join(" ").replace(/\s+/g, " ").trim();
-    if (t.length >= 60) text += `\n[Page ${p}]\n${t}\n`;
-    else if (images.length < MAX_PDF_IMG_PAGES) {           // scanned / CamScanner / image-only page
-      const v0 = page.getViewport({ scale: 1 });
-      const [w] = fit(v0.width, v0.height);
-      const vp = page.getViewport({ scale: w / v0.width });
-      const c = document.createElement("canvas"); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
-      const ctx = c.getContext("2d")!; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
-      await page.render({ canvasContext: ctx, viewport: vp }).promise;
-      images.push(canvasToJpeg(c)); c.width = c.height = 0;
-    } else skipped++;
-    page.cleanup();
+  const total = doc.numPages;
+  try {
+    const n = Math.min(total, MAX_PDF_PAGES);
+    let text = ""; const images: string[] = []; let skipped = 0;
+    for (let p = 1; p <= n; p++) {
+      const page = await doc.getPage(p);
+      const tc = await page.getTextContent();
+      const t = tc.items.map((i) => ("str" in i ? i.str : "")).join(" ").replace(/\s+/g, " ").trim();
+      if (t.length >= 60) text += `\n[Page ${p}]\n${t}\n`;
+      else if (images.length < MAX_PDF_IMG_PAGES) {           // scanned / CamScanner / image-only page (its few words of text, if any, are kept too)
+        if (t) text += `\n[Page ${p}]\n${t}\n`;
+        const v0 = page.getViewport({ scale: 1 });
+        const [w] = fit(v0.width, v0.height);
+        const vp = page.getViewport({ scale: w / v0.width });
+        const c = document.createElement("canvas"); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+        const ctx = c.getContext("2d")!; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        images.push(canvasToJpeg(c)); c.width = c.height = 0;
+      } else if (t) text += `\n[Page ${p}]\n${t}\n`;         // image budget used up: a short text-only page must not be lost
+      else skipped++;
+      page.cleanup();
+    }
+    const warn = [total > n ? `only the first ${n} of ${total} pages were read` : "", skipped ? `${skipped} scanned page(s) skipped (limit ${MAX_PDF_IMG_PAGES} page images)` : ""].filter(Boolean).join("; ");
+    return { text, images, warn };
+  } finally {
+    await doc.destroy();                                     // frees pdf.js worker memory, also when a page failed to render
   }
-  await doc.destroy();                                       // frees pdf.js worker memory for this document
-  const warn = [doc.numPages > n ? `only the first ${n} of ${doc.numPages} pages were read` : "", skipped ? `${skipped} scanned page(s) skipped (limit ${MAX_PDF_IMG_PAGES} page images)` : ""].filter(Boolean).join("; ");
-  return { text, images, warn };
 }
 
 const TEXT_EXT = new Set(["txt", "csv", "tsv", "md", "json", "log"]);
@@ -91,13 +98,20 @@ export async function processFile(file: File): Promise<Att> {
       if (declaredZipBytes(buf) > MAX_DOCX_INFLATED) { a.warn = "this .docx is not safe to open (it would expand to an unreasonable size)"; a.label = "DOCX"; return a; }
       a.text = (await mammoth.extractRawText({ arrayBuffer: buf })).value; a.label = "DOCX";
     } else if (TEXT_EXT.has(ext) || file.type.startsWith("text/")) {
-      a.text = await file.text(); a.label = ext.toUpperCase() || "TXT";
-      if (ext === "csv" || ext === "tsv") a.text = summarizeCsv(a.text);
+      a.label = ext.toUpperCase() || "TXT";
+      const isCsv = ext === "csv" || ext === "tsv";
+      const cut = !isCsv && file.size > MAX_TEXT_BYTES;
+      a.text = await (cut ? file.slice(0, MAX_TEXT_BYTES) : file).text();
+      if (cut) a.warn = `only the first ${MAX_TEXT_BYTES / 1048576} MB of this text file were read`;
+      if (isCsv) a.text = summarizeCsv(a.text);
     } else if (ext === "doc") {
       a.warn = "old .doc files are not supported - save as .docx or PDF";
     } else {
       a.warn = "unsupported file type";
     }
   } catch (e) { a.warn = `could not read file (${(e as Error).message})`; }
+  // An empty .txt/.csv/.docx used to end up with neither text nor warning: sending was then refused with "see the red notes" and there was none.
+  if (!a.text.trim()) a.text = "";
+  if (!a.warn && !a.text && !a.images.length) a.warn = "no readable content found";
   return a;
 }

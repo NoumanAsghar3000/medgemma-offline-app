@@ -9,7 +9,7 @@ import { buildReportPdf, isStructured, parseSections, type ReportFile } from "./
 
 interface Status { state: "need_model_folder" | "loading" | "ready" | "idle" | "error"; message: string; model_dir: string; compute: string;
   model: string; quant: string; family: string; multimodal: boolean; ctx: number; note: string; idle_minutes: number;
-  tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; forced: boolean; model_file: string }
+  tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; forced: boolean; model_file: string; gpu_available?: boolean }
 interface Variant { file: string; family: string; quant: string; size_gb: number; multimodal: boolean; tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; auto: boolean; current: boolean }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -28,8 +28,13 @@ function render(s: Status) {
   const badge = $("badge"); const gate = $("gate"); const body = $("gate-body");
   badge.className = "badge";
   $<HTMLSelectElement>("mem").value = String(s.idle_minutes);
+  const csel = $<HTMLSelectElement>("compute");
+  csel.value = s.compute === "gpu" ? "gpu" : "cpu";
+  (csel.querySelector('option[value="gpu"]') as HTMLOptionElement).disabled = !s.gpu_available && s.compute !== "gpu";
   showWarn(s);
-  if ((s.state === "ready" || s.state === "idle") && s.model_file !== lastVariantFile) { lastVariantFile = s.model_file; void refreshVariants(); }
+  // the estimates depend on the folder, the processor and the loaded file: refresh when any of them changes (not only the file name)
+  const vkey = `${s.model_dir}|${s.compute}|${s.model_file}`;
+  if ((s.state === "ready" || s.state === "idle") && vkey !== lastVariantKey) { lastVariantKey = vkey; lastVariantFile = s.model_file; void refreshVariants(); }
   if (s.state === "ready" || s.state === "error" || s.state === "need_model_folder") waiters.splice(0).forEach((w) => w(s.state === "ready"));
   if (s.state === "idle") {
     badge.textContent = "model unloaded · RAM freed"; gate.hidden = true;
@@ -40,7 +45,7 @@ function render(s: Status) {
   } else if (s.state === "loading") {
     badge.textContent = "loading model…";
     gate.hidden = false;
-    body.innerHTML = `<div class="spin"></div><h2>Loading ${esc(s.family)}…</h2><p class="muted">${esc(s.message)}</p>` +
+    body.innerHTML = `<div class="spin"></div><h2>Loading ${esc(s.family || "the model")}…</h2><p class="muted">${esc(s.message)}</p>` +
       (s.note ? `<p class="muted">${esc(s.note)}</p>` : "") + `<p class="muted" id="elapsed"></p>`;
     startTimer();
   } else if (s.state === "need_model_folder") {
@@ -65,6 +70,7 @@ function render(s: Status) {
   updateSend();
 }
 let lastVariantFile = "";
+let lastVariantKey = "";
 let variantList: Variant[] = [];
 const fmtTps = (a: number, b: number) => (Math.abs(a - b) < 0.05 ? `~${a.toFixed(1)}` : `~${b.toFixed(1)}-${a.toFixed(1)}`) + " tok/s";
 function showWarn(s: Status) {
@@ -85,6 +91,13 @@ async function refreshVariants() {
   } catch { sel.innerHTML = `<option value="">Automatic</option>`; }
 }
 const MIN_TPS = 0.5;
+$("compute").onchange = async (e) => {
+  const sel = e.target as HTMLSelectElement; const want = sel.value;
+  const revert = () => { sel.value = st?.compute === "gpu" ? "gpu" : "cpu"; };
+  if (busy) { revert(); return; }                          // switching restarts the engine: never in the middle of an answer
+  try { await invoke("set_compute", { compute: want }); }
+  catch (err) { revert(); const w = $("warn"); w.hidden = false; w.classList.remove("forced"); w.textContent = String(err); }
+};
 function fmtDuration(sec: number) { return sec < 5400 ? `${Math.max(1, Math.round(sec / 60))} minutes` : `${(sec / 3600).toFixed(1)} hours`; }
 $("variant").onchange = (e) => {
   const sel = e.target as HTMLSelectElement; const file = sel.value; const v = variantList.find((x) => x.file === file);
@@ -169,7 +182,8 @@ $("cam-shot").onclick = () => {
 const input = $<HTMLTextAreaElement>("input"); const sendBtn = $<HTMLButtonElement>("send");
 function updateSend() { sendBtn.disabled = !busy && ((st?.state !== "ready" && st?.state !== "idle") || pending > 0 || (!input.value.trim() && !atts.some((a) => a.images.length || a.text))); sendBtn.textContent = busy ? "■" : "➤"; }
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 180) + "px"; updateSend(); });
-input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+// Enter that commits an IME composition (Urdu, Chinese, Japanese ...) is not "send"
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
 sendBtn.onclick = () => (busy ? abort?.abort() : send());
 
 function addMsg(role: "user" | "assistant", html: string): HTMLElement {
@@ -207,6 +221,7 @@ async function send() {
   addMsg("user", `${thumbs ? `<div class="thumbs">${thumbs}</div>` : ""}${names}${names ? "<br>" : ""}${esc(text)}`);
   input.value = ""; input.style.height = "auto"; atts = []; renderChips();
 
+  const epoch = caseEpoch;
   const out = addMsg("assistant", `<span class="muted">Analysing… (large images/PDFs can take a while on CPU)</span>`);
   const msgs = buildMessages(history, text, sent, st!.ctx);
   let acc = ""; let speed = ""; let nTok = 0; let tFirst = 0; busy = true; abort = new AbortController(); updateSend();
@@ -217,6 +232,7 @@ async function send() {
     if ((e as Error).name !== "AbortError") out.innerHTML += `<p class="err">${esc(String(e instanceof Error ? e.message : e))}</p>`;
   } finally {
     busy = false; abort = null; updateSend(); $("live").textContent = "";
+    if (epoch !== caseEpoch) return;                      // "New case" was pressed meanwhile: this exchange belongs to the PREVIOUS patient and must not enter the new case
     const doc = sent.filter((a) => a.text).map((a) => `[file: ${a.name}]`).join(" ");
     history.push({ role: "user", text: `${text} ${doc}`.trim() }, { role: "assistant", text: acc });
     if (acc.trim()) {
@@ -265,8 +281,9 @@ $("messages").addEventListener("click", (e) => {
   if (t instanceof HTMLImageElement && t.closest(".thumbs")) { ($("lightbox-img") as HTMLImageElement).src = t.src; $("lightbox").hidden = false; }
 });
 $("lightbox").onclick = () => ($("lightbox").hidden = true);
+let caseEpoch = 0;                                         // incremented by "New case"; an answer still streaming from the old case is discarded
 $("newcase").onclick = () => {
-  abort?.abort(); history.length = 0; atts = []; renderChips(); answers.clear();
+  caseEpoch++; abort?.abort(); history.length = 0; atts = []; renderChips(); answers.clear();
   $("messages").innerHTML = emptyHTML; $("live").textContent = ""; input.value = ""; input.style.height = "auto"; updateSend();
 };
 function applyTheme(t: string | null) { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }

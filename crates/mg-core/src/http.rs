@@ -88,7 +88,10 @@ pub fn post_sse(port: u16, token: &str, body: &str, cancel: &AtomicBool, mut on_
     }
     if status != 200 {
         if !line_buf.is_empty() { err_body.push_str(&String::from_utf8_lossy(&line_buf)); }
-        return Err(format!("Model server error {status}: {}", err_body.chars().take(400).collect::<String>()));
+        // llama-server answers {"error":{"message":"..."}}: show the sentence, not the JSON
+        let msg = serde_json::from_str::<serde_json::Value>(&err_body).ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string)).unwrap_or(err_body);
+        return Err(format!("Model server error {status}: {}", msg.chars().take(400).collect::<String>()));
     }
     if !line_buf.is_empty() { if let Some(d) = String::from_utf8_lossy(&line_buf).trim().strip_prefix("data:") { on_event(d.trim().to_string()); } }
     Ok(())
@@ -98,6 +101,13 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> { h.windows(n.len()).position(|w| w
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test] fn server_error_json_is_shown_as_its_message() {
+        let body = r#"{"error":{"code":400,"message":"image input is not supported - hint: start the server with --mmproj","type":"invalid_request_error"}}"#;
+        let port = serve(vec![format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()]);
+        let e = post_sse(port, "t", "{}", &AtomicBool::new(false), |_| {}).unwrap_err();
+        assert!(e.contains("400") && e.contains("image input is not supported") && !e.contains("invalid_request_error"), "{e}");
+    }
+
     use super::*;
     use std::net::TcpListener;
     /// Read the WHOLE request (headers + Content-Length body) like a real server. Closing a socket with unread request bytes

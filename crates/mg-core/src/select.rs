@@ -55,6 +55,15 @@ const QUANTS: &[&str] = &[
     "Q3_K_XL", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q2_K_XL", "Q2_K", "BF16", "F16", "F32",
 ];
 
+/// "Q8_K_XL" / "Q8_0" -> "8", "IQ4_XS" -> "4", "F16" -> "F16". Two tags of one class (a name's Q8_K_XL vs the header's Q8_0) are the same precision;
+/// different classes mean the NAME is wrong (a Q4 file called ...-Q8_0.gguf), and the header wins.
+fn bit_class(q: &str) -> String {
+    match q.strip_prefix("IQ").or_else(|| q.strip_prefix('Q')) {
+        Some(r) => r.chars().take_while(|c| c.is_ascii_digit()).collect(),
+        None => q.to_string(),
+    }
+}
+
 fn has_token(lower: &str, tok: &str) -> bool {
     // match "27b"/"4b" only as a whole size token (not "14b", "24b")
     let b = lower.as_bytes();
@@ -148,7 +157,7 @@ pub fn enrich(inv: &mut Inventory) {
                 // CONTENT WINS over the file name / folder. 8-bit vs 16-bit: the header's file type is authoritative for the exact
                 // tags (F32 / F16 / BF16 / Q8_0); other quantization tags keep the name's more specific label (e.g. Q8_K_XL).
                 if let Some(q) = i.quant_name() {
-                    if f.quant == "unknown" || matches!(q, "F32" | "F16" | "BF16" | "Q8_0") {
+                    if f.quant == "unknown" || matches!(q, "F32" | "F16" | "BF16" | "Q8_0") || bit_class(&f.quant) != bit_class(q) {
                         f.quant = q.to_string();
                         f.quant_source = if i.file_type.and_then(gguf::ftype_name).is_some() { "file_type" } else { "tensors" };
                     }
@@ -398,6 +407,20 @@ pub fn health(inv: &Inventory) -> Health {
 
 #[cfg(test)]
 mod tests {
+    #[test] fn bit_class_groups_variants_of_one_precision() {
+        assert_eq!(bit_class("Q8_K_XL"), bit_class("Q8_0")); assert_eq!(bit_class("IQ4_XS"), bit_class("Q4_K_M"));
+        assert_ne!(bit_class("Q8_0"), bit_class("Q4_K_M")); assert_ne!(bit_class("F16"), bit_class("BF16"));
+    }
+    #[test] fn a_q4_file_named_q8_is_ranked_by_its_header_not_its_name() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hdr-4b-q4km.gguf");
+        if !src.is_file() { return; }
+        let d = std::env::temp_dir().join(format!("mg_misnamed_{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap();
+        std::fs::copy(&src, d.join("medgemma-4b-it-Q8_0.gguf")).unwrap();
+        let inv = scan(&d).unwrap(); let _ = std::fs::remove_dir_all(&d);
+        let m = inv.files.iter().find(|f| !f.is_mmproj).unwrap();
+        assert_eq!(m.quant, "Q4_K_M", "name said Q8_0 but the header says Q4_K_M"); assert_eq!(m.quant_source, "file_type");
+    }
+
     use super::*;
     use crate::plan::Bandwidth;
     use std::path::PathBuf;

@@ -5,7 +5,7 @@
   const scenario = new URLSearchParams(location.search).get("scenario") || "ready";
   const GB = 1;
   const base = { state: "ready", message: "", model_dir: "D:\\models", compute: "cpu", model: "medgemma-27b-it-Q4_K_M.gguf", quant: "Q4_K_M", family: "MedGemma 27B", multimodal: true,
-    ctx: 8192, note: "", idle_minutes: 5, tps_best: 2.4, tps_worst: 2.3, verdict: "interactive", streamed_gb: 0, forced: false, model_file: "medgemma-27b-it-Q4_K_M.gguf" };
+    ctx: 8192, note: "", idle_minutes: 5, tps_best: 2.4, tps_worst: 2.3, verdict: "interactive", streamed_gb: 0, forced: false, model_file: "medgemma-27b-it-Q4_K_M.gguf", gpu_available: true };
   let status = scenario === "relink"
     ? { ...base, state: "need_model_folder", model: "", model_file: "", family: "", quant: "", message: "Backend model files not found. The model files in this folder cannot be used - medgemma-27b-it-Q8_0.gguf: mmproj-F16.gguf was made for a model with embedding size 2560, but this model has 5376: use the matching mmproj (27B: 5376, 4B: 2560)", model_dir: "D:\\models-old" }
     : { ...base };
@@ -33,6 +33,7 @@
         case "list_variants": return variants.map((v) => ({ ...v, current: v.file === status.model_file }));
         case "set_memory_mode": status = { ...status, idle_minutes: args.minutes }; emit("status", status); return null;
         case "retry": load({}); return null;
+        case "set_compute": load({ compute: args.compute }); return null;
         case "choose_variant": {
           const v = variants.find((x) => x.file === args.file) || variants[1];
           load({ model: v.file, model_file: v.file, quant: v.quant, family: v.family, tps_best: v.tps_best, tps_worst: v.tps_worst, verdict: v.verdict, streamed_gb: v.streamed_gb, forced: v.tps_worst < 0.5 });

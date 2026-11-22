@@ -34,6 +34,8 @@ struct Status {
     streamed_gb: f64,
     forced: bool,
     model_file: String,
+    /// a Vulkan-capable GPU (>= 2 GB VRAM) AND the GPU engine are present: the CPU/GPU switch in the header offers GPU
+    gpu_available: bool,
 }
 
 struct Conn { port: u16, token: String }
@@ -45,13 +47,18 @@ struct AppState {
     chat_cancel: AtomicBool,
     busy: AtomicBool,
     last_active: Mutex<Instant>,
+    /// Hardware + bandwidth measured BEFORE the current model was loaded. The variant list reuses them: measured again with the model
+    /// resident, free RAM is lower by the model's own size and every estimate (and the "very slow" warning) would be wrong.
+    machine: Mutex<Option<(hw::Hardware, mg_core::plan::Bandwidth)>>,
 }
 
 fn exe_dir() -> PathBuf { std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default() }
 fn user_cfg(app: &AppHandle) -> PathBuf { app.path().app_data_dir().unwrap_or_else(|_| exe_dir()).join("config.json") }
 fn load_cfg(app: &AppHandle) -> Config {
-    // user config (written when the folder is re-linked / memory mode changed) wins over the installer's seed
-    Config::load(&user_cfg(app)).or_else(|| Config::load(&exe_dir().join("install.json"))).unwrap_or_default()
+    // The user's config (written when the folder is re-linked / a setting is changed) wins over the installer's install.json,
+    // unless the installer was run again since: then its new CPU/GPU and model-folder choices apply (see Config::resolve).
+    let seed = std::fs::read_to_string(exe_dir().join("install.json")).ok();
+    Config::resolve(Config::load(&user_cfg(app)), seed.as_deref())
 }
 /// Per-session server key. Fails CLOSED: if the OS cannot supply randomness the engine is not started (an ignored error here used to
 /// leave an all-zero, guessable key).
@@ -74,18 +81,32 @@ fn bootstrap(app: AppHandle) {
         c.store(true, Ordering::SeqCst);
         *c = Arc::new(AtomicBool::new(false));
     }
-    {
+    // Show "loading" AT ONCE. Until the worker publishes its first status (hardware probe + bandwidth measurement, a second or more),
+    // the UI would otherwise show the previous state - at start-up an empty status, which it renders as "The model could not start".
+    let (old_child, snapshot) = {
         let mut g = st.inner.lock().unwrap();
-        if let Some(mut ch) = g.child.take() { backend::kill(&mut ch); }
         g.conn = None;
-    }
+        g.status.state = "loading".into();
+        g.status.message = "Preparing the model...".into();
+        (g.child.take(), g.status.clone())
+    };
+    let _ = app.emit("status", snapshot);
+    // Stop the previous engine OUTSIDE the lock: releasing a mapped 20+ GB model can take seconds and must not block status queries.
+    if let Some(mut ch) = old_child { backend::kill(&mut ch); }
     let cancel = st.boot_cancel.lock().unwrap().clone();
 
     std::thread::spawn(move || {
+        // A newer bootstrap supersedes this one: it must not publish anything any more (stale errors / states would overwrite the new run).
+        let cancelled = || cancel.load(Ordering::SeqCst);
         let cfg = load_cfg(&app);
         let mut s = Status { model_dir: cfg.model_dir.clone(), compute: cfg.compute.clone(), idle_minutes: cfg.idle_minutes, ..Default::default() };
         let hw = hw::detect();
-        let (plan, compute, note) = match backend::prepare(&cfg, &hw, &exe_dir()) {
+        s.gpu_available = hw.gpu_ok && backend::server_exe(&exe_dir(), mg_core::select::Compute::Gpu).is_file();
+        let bw = backend::probe_bandwidth(&cfg);
+        *app.state::<AppState>().machine.lock().unwrap() = Some((hw.clone(), bw));
+        let prepared = backend::prepare_with(&cfg, &hw, &exe_dir(), bw);
+        if cancelled() { return; }
+        let (plan, compute, note) = match prepared {
             Ok(x) => x,
             Err(backend::Prep::NeedFolder(m)) => { s.state = "need_model_folder".into(); s.message = m; return publish(&app, s); }
             Err(backend::Prep::Error(m)) => { s.state = "error".into(); s.message = m; return publish(&app, s); }
@@ -107,17 +128,19 @@ fn bootstrap(app: AppHandle) {
         let log = app.path().app_log_dir().unwrap_or_else(|_| exe_dir()).join("backend.log");
         match backend::start_ready(&plan, compute, &exe_dir(), &log, &tok, &cancel, Duration::from_secs(30 * 60)) {
             Ok(l) => {
-                if cancel.load(Ordering::SeqCst) { let mut c = l.child; backend::kill(&mut c); return; }
                 {
                     let state = app.state::<AppState>();
                     let mut g = state.inner.lock().unwrap();
+                    // Checked INSIDE the lock: a newer bootstrap sets `cancel` first and only then takes this lock to collect the child, so either
+                    // it sees this child (and stops it) or we see `cancel` here. Otherwise the old engine would be orphaned, holding all its RAM.
+                    if cancelled() { drop(g); let mut c = l.child; backend::kill(&mut c); return; }
                     g.child = Some(l.child); g.conn = Some(Conn { port: l.port, token: tok });
                 }
                 touch(&app);
                 s.state = "ready".into(); s.message = String::new();
                 publish(&app, s);
             }
-            Err(e) => { if e == "cancelled" { return; } s.state = "error".into(); s.message = e; publish(&app, s); }
+            Err(e) => { if e == "cancelled" || cancelled() { return; } s.state = "error".into(); s.message = e; publish(&app, s); }
         }
     });
 }
@@ -133,12 +156,13 @@ fn start_idle_watcher(app: AppHandle) {
         if mins >= 9999 { continue; }
         let limit = if mins == 0 { Duration::from_secs(4) } else { Duration::from_secs(mins as u64 * 60) };
         if st.last_active.lock().unwrap().elapsed() < limit { continue; }
-        if let Some(mut ch) = g.child.take() { backend::kill(&mut ch); }
+        let child = g.child.take();
         g.conn = None;
         g.status.state = "idle".into();
         g.status.message = "Model unloaded to free memory. It reloads automatically when you send your next message.".into();
         let s = g.status.clone(); drop(g);
         let _ = app.emit("status", s);
+        if let Some(mut ch) = child { backend::kill(&mut ch); }   // outside the lock: freeing a mapped model can take seconds
     });
 }
 
@@ -165,7 +189,7 @@ fn pick_model_folder(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn retry(app: AppHandle) { bootstrap(app); }
 
 #[derive(Serialize)]
@@ -175,7 +199,12 @@ struct VariantInfo { file: String, family: String, quant: String, size_gb: f64, 
 #[tauri::command(async)]
 fn list_variants(app: AppHandle) -> Result<Vec<VariantInfo>, String> {
     let cfg = load_cfg(&app);
-    let (vs, auto) = backend::list_variants(&cfg, &hw::detect(), &exe_dir())?;
+    let snapshot = app.state::<AppState>().machine.lock().unwrap().clone();
+    let (hwd, bw) = match snapshot {
+        Some(x) => x,
+        None => { let h = hw::detect(); let b = backend::probe_bandwidth(&cfg); (h, b) }
+    };
+    let (vs, auto) = backend::list_variants_with(&cfg, &hwd, &exe_dir(), bw)?;
     let cur = app.state::<AppState>().inner.lock().unwrap().status.model_file.clone();
     Ok(vs.into_iter().map(|p| {
         let file = p.model.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -186,7 +215,7 @@ fn list_variants(app: AppHandle) -> Result<Vec<VariantInfo>, String> {
 }
 
 /// Force a variant by file name ("" = back to the automatic policy) and reload.
-#[tauri::command]
+#[tauri::command(async)]
 fn choose_variant(app: AppHandle, file: String) -> Result<(), String> {
     let mut cfg = load_cfg(&app);
     cfg.forced_model = file;
@@ -195,7 +224,25 @@ fn choose_variant(app: AppHandle, file: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+/// CPU / GPU switch in the header (the installer's choice is only the starting point). GPU needs a Vulkan-capable GPU with >= 2 GB VRAM
+/// and the GPU engine that the installer copies when the GPU option was selected; otherwise the request is refused with a clear reason.
+#[tauri::command(async)]
+fn set_compute(app: AppHandle, compute: String) -> Result<(), String> {
+    let want = compute.trim().to_ascii_lowercase();
+    if want != "cpu" && want != "gpu" { return Err("Unknown processor choice.".into()); }
+    if want == "gpu" {
+        let h = hw::detect();
+        if !h.gpu_ok { return Err("GPU is not available: no Vulkan-capable graphics card with at least 2 GB of video memory was found on this computer.".into()); }
+        if !backend::server_exe(&exe_dir(), mg_core::select::Compute::Gpu).is_file() { return Err("GPU is not available: the GPU engine was not installed. Run the setup again and select GPU.".into()); }
+    }
+    let mut cfg = load_cfg(&app);
+    cfg.compute = want;
+    cfg.save(&user_cfg(&app)).map_err(|e| format!("Could not save settings: {e}"))?;
+    bootstrap(app);
+    Ok(())
+}
+
+#[tauri::command(async)]
 fn set_memory_mode(app: AppHandle, minutes: u32) -> Result<(), String> {
     let mut cfg = load_cfg(&app);
     cfg.idle_minutes = minutes;
@@ -287,9 +334,10 @@ fn main() {
             boot_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             chat_cancel: AtomicBool::new(false), busy: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
+            machine: Mutex::new(None),
         })
         .setup(|app| { create_main_window(app)?; bootstrap(app.handle().clone()); start_idle_watcher(app.handle().clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![get_status, pick_model_folder, retry, list_variants, choose_variant, set_memory_mode, chat_stream, chat_cancel, save_report])
+        .invoke_handler(tauri::generate_handler![get_status, pick_model_folder, retry, list_variants, choose_variant, set_compute, set_memory_mode, chat_stream, chat_cancel, save_report])
         .build(tauri::generate_context!())
         .expect("failed to build app");
 

@@ -3,7 +3,7 @@
 use crate::{bench, config::Config, hw::Hardware, plan::Bandwidth, select::*, HEADROOM, MIN_TOTAL_RAM};
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -32,10 +32,14 @@ pub fn server_exe(exe_dir: &Path, c: Compute) -> PathBuf {
 /// Validate the saved folder and decide which model + compute path to use *right now*.
 /// Measures RAM and drive bandwidth (about a second) so the planner works from real numbers.
 pub fn prepare(cfg: &Config, hw: &Hardware, exe_dir: &Path) -> Result<(Plan, Compute, String), Prep> {
-    let dir = cfg.model_path();
-    let probe_file = scan(&dir).ok().and_then(|inv| inv.files.iter().filter(|f| !f.is_mmproj).max_by_key(|f| f.size).map(|f| f.path.clone()));
-    let bw = bench::measure(probe_file.as_deref());
-    prepare_with(cfg, hw, exe_dir, bw)
+    prepare_with(cfg, hw, exe_dir, probe_bandwidth(cfg))
+}
+
+/// Measure RAM and drive bandwidth (the drive that holds the model folder). Call it BEFORE a model is loaded and keep the result:
+/// measuring again later, while the model occupies memory and the CPU, gives numbers that mislead the speed estimates.
+pub fn probe_bandwidth(cfg: &Config) -> Bandwidth {
+    let probe_file = scan(&cfg.model_path()).ok().and_then(|inv| inv.files.iter().filter(|f| !f.is_mmproj).max_by_key(|f| f.size).map(|f| f.path.clone()));
+    bench::measure(probe_file.as_deref())
 }
 
 pub fn prepare_with(cfg: &Config, hw: &Hardware, exe_dir: &Path, bw: Bandwidth) -> Result<(Plan, Compute, String), Prep> {
@@ -70,10 +74,13 @@ pub fn prepare_with(cfg: &Config, hw: &Hardware, exe_dir: &Path, bw: Bandwidth) 
 
 /// All installed variants with estimates for the in-app selector; second value = file the automatic policy would pick.
 pub fn list_variants(cfg: &Config, hw: &Hardware, exe_dir: &Path) -> Result<(Vec<Plan>, Option<String>), String> {
+    list_variants_with(cfg, hw, exe_dir, probe_bandwidth(cfg))
+}
+
+/// Same, with hardware and bandwidth measured earlier (before the current model was loaded).
+pub fn list_variants_with(cfg: &Config, hw: &Hardware, exe_dir: &Path, bw: Bandwidth) -> Result<(Vec<Plan>, Option<String>), String> {
     let dir = cfg.model_path();
     let inv = scan(&dir).map_err(|e| e.to_string())?;
-    let probe_file = inv.files.iter().filter(|f| !f.is_mmproj).max_by_key(|f| f.size).map(|f| f.path.clone());
-    let bw = bench::measure(probe_file.as_deref());
     let mut compute = Compute::parse(&cfg.compute);
     if compute == Compute::Gpu && (!hw.gpu_ok || !server_exe(exe_dir, Compute::Gpu).is_file()) { compute = Compute::Cpu; }
     let mc = Machine { budget: hw.free_ram.saturating_sub(HEADROOM), compute, vram: hw.vram, bw };
@@ -133,7 +140,14 @@ pub fn http_status(port: u16, path: &str) -> Option<u16> {
 }
 
 pub fn log_tail(log: &Path) -> String {
-    let s = std::fs::read_to_string(log).unwrap_or_default();
+    // Only the last 64 KB, decoded leniently: the engine's log can contain bytes that are not valid UTF-8 (ANSI code-page paths of
+    // non-English Windows user names), and a strict read would silently return NOTHING exactly when the error text is needed.
+    let Ok(mut f) = File::open(log) else { return String::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(64 * 1024))).is_err() { return String::new(); }
+    let mut buf = Vec::new();
+    let _ = f.take(64 * 1024).read_to_end(&mut buf);
+    let s = String::from_utf8_lossy(&buf);
     let t: Vec<&str> = s.lines().rev().take(12).collect();
     t.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
@@ -197,6 +211,15 @@ fn kill_with_parent(_: &Child) {}
 
 #[cfg(test)]
 mod tests {
+    #[test] fn log_tail_survives_invalid_utf8_and_big_logs() {
+        let p = std::env::temp_dir().join(format!("mg_logtail_{}.log", std::process::id()));
+        let mut b = vec![b'x'; 200_000]; b.extend_from_slice(b"\nloading C:\\Users\\M\xfcller\\m.gguf\nerror: out of memory\n");
+        std::fs::write(&p, &b).unwrap();
+        let t = log_tail(&p); let _ = std::fs::remove_file(&p);
+        assert!(t.contains("error: out of memory"), "{t}"); assert!(t.contains("loading C:"), "{t}"); assert!(t.len() < 70_000);
+        assert_eq!(log_tail(Path::new("/definitely/not/here.log")), "");
+    }
+
     use super::*;
     use crate::GIB;
     fn hw(free_gb: u64) -> Hardware { Hardware { total_ram: 16 * GIB, free_ram: free_gb * GIB, ..Default::default() } }

@@ -37,6 +37,9 @@ export function buildMessages(history: Turn[], text: string, atts: Att[], ctx: n
   for (let i = history.length - 1; i >= 0 && left > 0; i--) {
     const t = history[i].text.slice(0, left); left -= t.length; past.unshift({ role: history[i].role, content: t });
   }
+  // The model's chat template requires user/assistant turns to alternate and to START with a user turn. Trimming from the oldest side can
+  // leave an assistant turn first, and the server then answers HTTP 500 ("Conversation roles must alternate"): drop such a leading turn.
+  while (past.length && past[0].role !== "user") past.shift();
   return [{ role: "system", content: SYSTEM }, ...past, { role: "user", content: nImg ? parts : firstText }];
 }
 
@@ -44,10 +47,13 @@ export function buildMessages(history: Turn[], text: string, atts: Att[], ctx: n
 export interface Timings { tps: number; tokens: number; promptTps: number }
 export async function streamChat(messages: unknown[], onDelta: (s: string) => void, signal: AbortSignal, onTimings?: (t: Timings) => void) {
   const ch = new Channel<string>();
+  let streamErr = "";
   ch.onmessage = (d) => {
     if (d === "[DONE]") return;
     try {
-      const j = JSON.parse(d); const c = j.choices?.[0]?.delta?.content; if (c) onDelta(c);
+      const j = JSON.parse(d);
+      if (j.error) { streamErr = String(j.error.message ?? j.error); return; }     // the server can fail AFTER the 200 header (e.g. context overflow)
+      const c = j.choices?.[0]?.delta?.content; if (c) onDelta(c);
       const t = j.timings;                                   // llama-server puts real speed in the final chunk
       if (t && onTimings) onTimings({ tps: Number(t.predicted_per_second) || 0, tokens: Number(t.predicted_n) || 0, promptTps: Number(t.prompt_per_second) || 0 });
     } catch { /* ignore keep-alives */ }
@@ -57,5 +63,6 @@ export async function streamChat(messages: unknown[], onDelta: (s: string) => vo
   try {
     await invoke("chat_stream", { body: JSON.stringify({ messages, stream: true, temperature: 0.2, max_tokens: 2048 }), onEvent: ch });
     await new Promise((r) => setTimeout(r, 60));          // let the last channel messages drain
+    if (streamErr) throw new Error(streamErr);
   } finally { signal.removeEventListener("abort", onAbort); }
 }

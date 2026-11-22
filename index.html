@@ -12,6 +12,10 @@
       <div class="hdr-right">
         <span class="pill offline" title="No network access: everything runs on this computer"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5zm-3 8V7a3 3 0 0 1 6 0v3H9z"/></svg> Offline &middot; private</span>
         <select id="variant" class="mem" title="Model variant (27B 8-bit / smaller quantizations / 4B) with estimated speed on this PC" aria-label="Model variant"></select>
+        <select id="compute" class="mem" title="Processor that runs the model: CPU or GPU (GPU needs a Vulkan-capable graphics card with at least 2 GB of video memory)" aria-label="Processor">
+          <option value="cpu">CPU</option>
+          <option value="gpu">GPU</option>
+        </select>
         <select id="mem" class="mem" title="Memory mode: when the model is unloaded from RAM" aria-label="Memory mode">
           <option value="9999">Keep model loaded</option>
           <option value="5">Free RAM after 5 min idle</option>
