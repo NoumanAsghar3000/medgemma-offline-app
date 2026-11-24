@@ -599,8 +599,9 @@ end;
 // or that already holds a previous install of this app, is locked down.
 procedure LockDownAppDir;
 var
-  Dir: String;
+  Dir, Icacls, JsonFile: String;
   Rc: Integer;
+  Probe: AnsiString;
 begin
   Dir := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
   if (Length(Dir) <= 3) or (not AppDirIsOurs) then
@@ -611,12 +612,35 @@ begin
              'for example under C:\Program Files, so that only administrators can modify the program files.', mbInformation, MB_OK);
     Exit;
   end;
-  Rc := RunHidden(ExpandConstant('{sys}\icacls.exe'),
-          QuoteArg(Dir) + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q');
+  Icacls := ExpandConstant('{sys}\icacls.exe');
+
+  // 1. The folder itself: SYSTEM + Administrators full control, Users read/execute, nothing inherited from the parent.
+  //    The entries are inheritable ((OI)(CI)), so everything below the folder receives them through normal inheritance.
+  Rc := RunHidden(Icacls, QuoteArg(Dir) + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q');
   if Rc = 0 then
     Log('SECURITY: install folder locked down (SYSTEM + Administrators full control, Users read/execute)')
   else
     Log('SECURITY WARNING: could not restrict permissions on ' + Dir + ' (icacls exit code ' + IntToStr(Rc) + ')');
+
+  // 2. Everything below the folder goes back to "inherit from the folder, no entries of its own". Rewriting each file's list one by one
+  //    (an earlier version did) depends on that file's history: files of an earlier run of this installer already carry explicit entries, and
+  //    a file that was written a moment ago could be left with an EMPTY list that denies everybody, administrators included. A reset gives
+  //    every file the same, correct result whether this is a fresh install or an upgrade. (The folder itself is locked first, so there is
+  //    never a moment in which the files are less protected than before.)
+  Rc := RunHidden(Icacls, QuoteArg(AddBackslash(Dir) + '*') + ' /reset /T /C /Q');
+  Log('SECURITY: permissions below the install folder reset to inherit (icacls exit code ' + IntToStr(Rc) + ')');
+
+  // 3. Self-check: the account that runs this setup must be able to read install.json. If not, repair that file and say so in the log.
+  JsonFile := AddBackslash(Dir) + 'install.json';
+  if FileExists(JsonFile) and (not LoadStringFromFile(JsonFile, Probe)) then
+  begin
+    Log('SECURITY WARNING: install.json is not readable after the lock-down; repairing its permissions');
+    RunHidden(Icacls, QuoteArg(JsonFile) + ' /reset /C /Q');
+    if LoadStringFromFile(JsonFile, Probe) then
+      Log('SECURITY: install.json is readable again')
+    else
+      Log('SECURITY WARNING: install.json is still not readable');
+  end;
 end;
 
 // ---------- "offline" enforced by the OS: the inference engine gets no network access ----------
