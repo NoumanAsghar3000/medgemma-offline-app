@@ -87,6 +87,9 @@ fn main() {
                     let _ = writeln!(s, "speed={speed}\nverdict={}\ngpu_gb={}\nram_gb={}\nstreamed_gb={}",
                         pl.verdict.label(), gb(pl.gpu_bytes), gb(pl.ram_bytes), gb(pl.streamed_bytes));
                     let _ = writeln!(s, "min_tps={}", plan::MIN_TPS);
+                    // sizes in MiB: the installer checks free disk space BEFORE it copies a multi-GB model into the install folder
+                    let mib = |b: u64| b / (1024 * 1024);
+                    let _ = writeln!(s, "model_mb={}\nmmproj_mb={}", mib(p.model_bytes), mib(if p.mmproj.is_some() { p.mmproj_bytes } else { 0 }));
                     let _ = writeln!(s, "model_path={}\nmmproj_path={}", p.model.display(), p.mmproj.map(|m| m.display().to_string()).unwrap_or_default());
                 }
                 Err(e) => { let _ = writeln!(s, "status=error\nmessage={e}"); }
@@ -94,5 +97,10 @@ fn main() {
         }
         _ => { eprintln!("usage: mg-probe hw|plan [--dir D] [--compute cpu|gpu] --out FILE"); std::process::exit(2); }
     }
-    match out { Some(f) => std::fs::write(f, s).expect("write out"), None => print!("{s}") }
+    // `--out` files are read by Inno Setup's TStringList.LoadFromFile, which decodes a file WITHOUT a byte-order mark as ANSI: a model folder
+    // with non-ASCII characters (accents, Arabic/Urdu/Chinese names) would come back garbled and the copy / validation would fail. A UTF-8 BOM fixes that.
+    match out {
+        Some(f) => { let mut bytes = vec![0xEF, 0xBB, 0xBF]; bytes.extend_from_slice(s.as_bytes()); std::fs::write(f, bytes).expect("write out") }
+        None => print!("{s}"),
+    }
 }
