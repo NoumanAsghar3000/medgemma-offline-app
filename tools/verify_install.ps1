@@ -29,6 +29,21 @@ function Get-AclProblems($acl) {
   return $problems
 }
 
+# Reads install.json. If that fails, say WHY (the real permissions of the file and its folder) instead of only "access denied",
+# so a permission problem in the installer can be diagnosed from the CI log alone.
+function Read-InstallJson([string]$Path) {
+  try { return (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json) }
+  catch {
+    Write-Host "Cannot read ${Path}: $($_.Exception.Message)"
+    if (Get-Command icacls.exe -ErrorAction SilentlyContinue) {
+      Write-Host '--- permissions of the file';   & icacls.exe $Path
+      Write-Host '--- permissions of the folder'; & icacls.exe (Split-Path -Parent $Path)
+      Write-Host "--- running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+    }
+    return $null
+  }
+}
+
 if ($Phase -eq 'installed') {
   $k = Get-ItemProperty $key -ErrorAction SilentlyContinue
   Need ($null -ne $k) 'registered in Apps & features (Uninstall key exists)'
@@ -49,7 +64,11 @@ if ($Phase -eq 'installed') {
   # --- the processor choice is recorded for the app ---
   $ij = Join-Path $AppDir 'install.json'
   Need (Test-Path $ij) 'install.json written'
-  if (Test-Path $ij) { $j = Get-Content $ij -Raw | ConvertFrom-Json; Need ($j.compute -eq $Compute) "install.json compute = '$($j.compute)' (expected '$Compute')" }
+  if (Test-Path $ij) {
+    $j = Read-InstallJson $ij
+    Need ($null -ne $j) 'install.json is readable by the administrator account that runs the checks'
+    if ($null -ne $j) { Need ($j.compute -eq $Compute) "install.json compute = '$($j.compute)' (expected '$Compute')" }
+  }
 
   # --- only administrators may change the program files (otherwise a standard user could plant code that runs for other users) ---
   $aclProblems = @(Get-AclProblems (Get-Acl -LiteralPath $AppDir))
