@@ -1,0 +1,19 @@
+# build output (all of it is recreated by CI / `npm run build` / `cargo build`)
+/node_modules/
+/dist/
+/target/
+/out/
+/staging/
+/dl/
+
+# code-signing material must NEVER be committed (see tools/new_selfsigned_cert.ps1 and the Signing section of the README)
+/cert/
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+*.p7b
+WINDOWS_CERTIFICATE*.txt
+*.pfx.b64
+codesign*
