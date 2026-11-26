@@ -96,6 +96,26 @@ async function awaitEndpoint(seconds) {
 const cdp = createCdp();
 const { send, ev, waitFor, click, text, setFiles } = cdp;
 
+/** What the user would see right now (runs inside the page). Kept as a real function so its source needs no escaping. */
+function pageState() {
+  const t = (id) => { const e = document.getElementById(id); return e ? e.innerText.replace(/\s+/g, " ").trim().slice(0, 400) : "(missing)"; };
+  const msgs = [...document.querySelectorAll(".msg")].map((m) => (m.classList.contains("user") ? "USER: " : "ASSISTANT: ") + m.innerText.replace(/\s+/g, " ").trim().slice(0, 500));
+  const send = document.getElementById("send"), gate = document.getElementById("gate");
+  return JSON.stringify({ badge: t("badge"), gateHidden: !!gate && gate.hidden, gate: t("gate-body"), sendDisabled: !!send && send.disabled, warn: t("warn"), chips: t("chips"), messages: msgs }, null, 1);
+}
+let dumped = false;
+/** Printed whenever the run fails: the screen as the user sees it plus the app's own logs, so one CI log explains the failure. */
+async function failureDump(label) {
+  if (dumped) return; dumped = true;
+  console.log(`--- UI STATE (${label}) ---`);
+  try { console.log(await ev(`(${pageState.toString()})()`)); } catch (e) { console.log("(page not reachable: " + e.message + ")"); }
+  const logDir = path.join(process.env.LOCALAPPDATA || "", "com.nouman.medgemma.offline", "logs");
+  for (const [name, f] of [["app diagnostics.log", "diagnostics.log"], ["engine backend.log", "backend.log"]]) {
+    const fp = path.join(logDir, f);
+    console.log(`--- ${name} (${fp}) ---\n` + (existsSync(fp) ? readFileSync(fp, "utf8").slice(-4000) : "(not written)"));
+  }
+}
+
 function png(w, h) {   // tiny valid RGB PNG (no deps)
   const raw = Buffer.alloc((w * 3 + 1) * h); for (let y = 0; y < h; y++) { raw[y * (w * 3 + 1)] = 0; for (let x = 0; x < w; x++) { const o = y * (w * 3 + 1) + 1 + x * 3; raw[o] = (x * 4) & 255; raw[o + 1] = (y * 4) & 255; raw[o + 2] = 128; } }
   const crcT = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
@@ -228,8 +248,11 @@ try {
   await waitFor(`document.querySelectorAll('#chips .chip').length>=4 && !document.querySelector('#chips .chip.busy')`, 60000, "chips again");
   await ev(`[...document.querySelectorAll('#chips .chip')].filter(c=>/camera-|xray/.test(c.innerText)).forEach(c=>c.querySelector('button').click()), true`);
   await ev(`(()=>{const i=document.getElementById('input'); i.value='Summarise the documents.'; i.dispatchEvent(new Event('input',{bubbles:true})); return true})()`);
+  const bubblesBefore = await ev(`document.querySelectorAll('.msg.assistant').length`);
   await click("#send");
-  await waitFor(`!!document.querySelector('.msg.assistant .actions button')`, 240000, "assistant answer");
+  // an answer shows an action bar; an error shows a red note in the NEW assistant bubble: fail at once with the server's own words
+  await waitFor(`!!document.querySelector('.msg.assistant .actions button')`, 240000, "assistant answer",
+    `(()=>{const a=[...document.querySelectorAll('.msg.assistant')]; if(a.length<=${bubblesBefore}) return ''; const e=a[a.length-1].querySelector('.err'); return e?e.innerText:''})()`);
   const ans = await ev(`document.querySelector('.msg.assistant .actions').closest('.bubble').innerText`);
   check("documents (CSV/TXT/PDF/DOCX) answered by the local server (streamed)", ans.trim().length > 5, ans.replace(/\s+/g, " "));
   const actions = await ev(`document.querySelector('.msg.assistant .actions').innerText`);
@@ -258,6 +281,7 @@ try {
   check("e2e run", false, e.stack || e.message);
 } finally {
   clearTimeout(watchdog);
+  if (results.some((r) => !r.ok && r.required)) await failureDump("at the end of a failed run");
   cleanup();
 }
 writeResults();

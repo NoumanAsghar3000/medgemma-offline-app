@@ -131,7 +131,6 @@ pub(crate) mod tests {
         });
         port
     }
-    fn chunk(s: &str) -> Vec<u8> { format!("{:x}\r\n{}\r\n", s.len(), s).into_bytes() }
 
     #[test] fn decodes_chunked_sse_even_when_split_mid_event_and_mid_utf8() {
         let ev1 = "data: {\"a\":\"h\u{e9}llo\"}\n\n"; let ev2 = "data: [DONE]\n\n";

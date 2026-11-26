@@ -19,6 +19,7 @@
   const setStatus = (s) => { status = s; emit("status", status); };
   const load = (patch, ms = 700) => { setStatus({ ...status, ...patch, state: "loading", message: "Loading model (mock)..." }); setTimeout(() => setStatus({ ...status, ...patch, state: "ready", message: "" }), ms); };
   window.__saved = null; window.__calls = [];
+  window.__emit = emit; window.__base = base;   // lets a test deliver status events by hand (e.g. out of order)
 
   window.__TAURI_INTERNALS__ = {
     transformCallback(cb) { const id = nid++; cbs[id] = cb; return id; },
@@ -43,6 +44,9 @@
         case "chat_cancel": cancel = true; return null;
         case "save_report": window.__saved = { filename: args.filename, bytes: Math.round((args.dataB64.length * 3) / 4), head: atob(args.dataB64.slice(0, 12)) }; return "C:\\Reports\\" + args.filename;
         case "chat_stream": {
+          // a test can plug a REAL engine in behind the real UI: window.__chatHook(body, emit) streams the server's SSE payloads through emit();
+          // if it throws, the page sees exactly what it sees when the shell returns an error string
+          if (window.__chatHook) { const ch0 = args.onEvent; let n = 0; await window.__chatHook(args.body, (message) => cbs[ch0.id]({ index: n++, message })); cbs[ch0.id]({ index: n, end: true }); return null; }
           cancel = false; const ch = args.onEvent; let i = 0; const parts = ANSWER.match(/.{1,4}/gs);
           await new Promise((resolve) => {
             const tick = () => {

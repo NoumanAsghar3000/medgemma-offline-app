@@ -22,6 +22,10 @@ pub enum Prep {
 
 pub const MSG_NOT_FOUND: &str = "Backend model files not found";
 
+/// True when the model folder is gone: never set, USB drive unplugged, folder renamed or moved. Used while a session is running to turn
+/// "the engine stopped answering" into the re-link dialog instead of a log dump.
+pub fn folder_missing(dir: &str) -> bool { dir.trim().is_empty() || !Path::new(dir.trim()).is_dir() }
+
 pub fn backend_dir(exe_dir: &Path, c: Compute) -> PathBuf {
     exe_dir.join("backend").join(if c == Compute::Gpu { "vulkan" } else { "cpu" })
 }
@@ -211,6 +215,22 @@ fn kill_with_parent(_: &Child) {}
 
 #[cfg(test)]
 mod tests {
+    #[test] fn folder_missing_detects_unplugged_moved_and_unset_folders() {
+        let d = std::env::temp_dir().join(format!("mg_folder_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap();
+        let s = d.display().to_string();
+        assert!(!folder_missing(&s), "an existing folder is not missing");
+        assert!(!folder_missing(&format!("  {s}  ")), "surrounding blanks are tolerated");
+        let moved = d.with_file_name(format!("mg_folder_{}_moved", std::process::id())); let _ = std::fs::remove_dir_all(&moved);
+        std::fs::rename(&d, &moved).unwrap();
+        assert!(folder_missing(&s), "after the folder is moved / the drive is unplugged it is missing");
+        let f = moved.join("a.txt"); std::fs::write(&f, "x").unwrap();
+        assert!(folder_missing(&f.display().to_string()), "a file is not a model folder");
+        let _ = std::fs::remove_dir_all(&moved);
+        assert!(folder_missing(""), "never set"); assert!(folder_missing("   "));
+        assert!(folder_missing("C:\\definitely\\not\\here"));
+    }
+
     #[test] fn log_tail_survives_invalid_utf8_and_big_logs() {
         let p = std::env::temp_dir().join(format!("mg_logtail_{}.log", std::process::id()));
         let mut b = vec![b'x'; 200_000]; b.extend_from_slice(b"\nloading C:\\Users\\M\xfcller\\m.gguf\nerror: out of memory\n");

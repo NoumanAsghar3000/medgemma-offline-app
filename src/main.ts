@@ -9,7 +9,7 @@ import { buildReportPdf, isStructured, parseSections, type ReportFile } from "./
 
 interface Status { state: "need_model_folder" | "loading" | "ready" | "idle" | "error"; message: string; model_dir: string; compute: string;
   model: string; quant: string; family: string; multimodal: boolean; ctx: number; note: string; idle_minutes: number;
-  tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; forced: boolean; model_file: string; gpu_available?: boolean }
+  tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; forced: boolean; model_file: string; gpu_available?: boolean; seq?: number }
 interface Variant { file: string; family: string; quant: string; size_gb: number; multimodal: boolean; tps_best: number; tps_worst: number; verdict: string; streamed_gb: number; auto: boolean; current: boolean }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -23,7 +23,11 @@ let busy = false;
 
 /* ---------------- backend status + model-folder gate ---------------- */
 const waiters: ((ok: boolean) => void)[] = [];
+let lastSeq = 0;
 function render(s: Status) {
+  // A status older than one already shown must never overwrite it: events and the get_status answer can arrive out of order, and a stale
+  // "loading" arriving after "need_model_folder" would leave the window waiting for a change that never comes.
+  if (typeof s.seq === "number") { if (s.seq < lastSeq) return; lastSeq = s.seq; }
   st = s;
   const badge = $("badge"); const gate = $("gate"); const body = $("gate-body");
   badge.className = "badge";

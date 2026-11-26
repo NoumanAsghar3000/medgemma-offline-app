@@ -7,8 +7,8 @@ use serde::Serialize;
 use std::{
     path::PathBuf,
     process::Child,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
-    time::{Duration, Instant},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_dialog::DialogExt;
@@ -36,6 +36,9 @@ struct Status {
     model_file: String,
     /// a Vulkan-capable GPU (>= 2 GB VRAM) AND the GPU engine are present: the CPU/GPU switch in the header offers GPU
     gpu_available: bool,
+    /// increases with every status change; the UI ignores a status that is older than one it has already shown (events and
+    /// get_status answers can arrive out of order, and a stale one must never overwrite a newer state)
+    seq: u64,
 }
 
 struct Conn { port: u16, token: String }
@@ -50,6 +53,7 @@ struct AppState {
     /// Hardware + bandwidth measured BEFORE the current model was loaded. The variant list reuses them: measured again with the model
     /// resident, free RAM is lower by the model's own size and every estimate (and the "very slow" warning) would be wrong.
     machine: Mutex<Option<(hw::Hardware, mg_core::plan::Bandwidth)>>,
+    seq: AtomicU64,
 }
 
 fn exe_dir() -> PathBuf { std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default() }
@@ -67,14 +71,35 @@ fn token() -> Result<String, String> {
     getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
-fn publish(app: &AppHandle, s: Status) {
-    app.state::<AppState>().inner.lock().unwrap().status = s.clone();
+/// Plain-text diagnostics next to the engine's own log (backend.log): every status change, and the size and outcome of every chat request.
+/// Only states, sizes and error messages go in (never the prompt, attachments or answers), so it holds no patient data. Capped at 2 MB.
+fn diag(app: &AppHandle, msg: &str) {
+    use std::io::Write;
+    let dir = app.path().app_log_dir().unwrap_or_else(|_| exe_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join("diagnostics.log");
+    if std::fs::metadata(&p).map(|m| m.len() > 2_000_000).unwrap_or(false) { let _ = std::fs::remove_file(&p); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let one_line: String = msg.chars().map(|c| if c.is_control() { ' ' } else { c }).take(400).collect();
+        let _ = writeln!(f, "{ms} {one_line}");
+    }
+}
+
+/// Next status number. Taken while the status lock is held, so the stored status always carries the newest number.
+fn next_seq(st: &AppState) -> u64 { st.seq.fetch_add(1, Ordering::SeqCst) + 1 }
+
+fn publish(app: &AppHandle, mut s: Status) {
+    let st = app.state::<AppState>();
+    { let mut g = st.inner.lock().unwrap(); s.seq = next_seq(&st); g.status = s.clone(); }
+    diag(app, &format!("status #{} {} model={} compute={} ctx={} {}", s.seq, s.state, s.model_file, s.compute, s.ctx, s.message));
     let _ = app.emit("status", s);
 }
+
 fn touch(app: &AppHandle) { *app.state::<AppState>().last_active.lock().unwrap() = Instant::now(); }
 
 /// (Re)start the whole pipeline on a worker thread; the UI never blocks.
-fn bootstrap(app: AppHandle) {
+fn bootstrap(app: AppHandle, announce: bool) {
     let st = app.state::<AppState>();
     {
         let mut c = st.boot_cancel.lock().unwrap();
@@ -88,9 +113,12 @@ fn bootstrap(app: AppHandle) {
         g.conn = None;
         g.status.state = "loading".into();
         g.status.message = "Preparing the model...".into();
+        g.status.seq = next_seq(&st);
         (g.child.take(), g.status.clone())
     };
-    let _ = app.emit("status", snapshot);
+    // At start-up nobody is listening yet (the page asks get_status when it is ready), so nothing is emitted from the setup callback.
+    diag(&app, "bootstrap: preparing the model");
+    if announce { let _ = app.emit("status", snapshot); }
     // Stop the previous engine OUTSIDE the lock: releasing a mapped 20+ GB model can take seconds and must not block status queries.
     if let Some(mut ch) = old_child { backend::kill(&mut ch); }
     let cancel = st.boot_cancel.lock().unwrap().clone();
@@ -160,6 +188,7 @@ fn start_idle_watcher(app: AppHandle) {
         g.conn = None;
         g.status.state = "idle".into();
         g.status.message = "Model unloaded to free memory. It reloads automatically when you send your next message.".into();
+        g.status.seq = next_seq(&st);
         let s = g.status.clone(); drop(g);
         let _ = app.emit("status", s);
         if let Some(mut ch) = child { backend::kill(&mut ch); }   // outside the lock: freeing a mapped model can take seconds
@@ -185,12 +214,12 @@ fn pick_model_folder(app: AppHandle) -> Result<bool, String> {
     let mut cfg = load_cfg(&app);
     cfg.model_dir = dir.display().to_string();
     cfg.save(&user_cfg(&app)).map_err(|e| format!("Could not save settings: {e}"))?;
-    bootstrap(app);
+    bootstrap(app, true);
     Ok(true)
 }
 
 #[tauri::command(async)]
-fn retry(app: AppHandle) { bootstrap(app); }
+fn retry(app: AppHandle) { bootstrap(app, true); }
 
 #[derive(Serialize)]
 struct VariantInfo { file: String, family: String, quant: String, size_gb: f64, multimodal: bool, tps_best: f64, tps_worst: f64, verdict: String, streamed_gb: f64, auto: bool, current: bool }
@@ -220,7 +249,7 @@ fn choose_variant(app: AppHandle, file: String) -> Result<(), String> {
     let mut cfg = load_cfg(&app);
     cfg.forced_model = file;
     cfg.save(&user_cfg(&app)).map_err(|e| e.to_string())?;
-    bootstrap(app);
+    bootstrap(app, true);
     Ok(())
 }
 
@@ -238,7 +267,7 @@ fn set_compute(app: AppHandle, compute: String) -> Result<(), String> {
     let mut cfg = load_cfg(&app);
     cfg.compute = want;
     cfg.save(&user_cfg(&app)).map_err(|e| format!("Could not save settings: {e}"))?;
-    bootstrap(app);
+    bootstrap(app, true);
     Ok(())
 }
 
@@ -248,7 +277,7 @@ fn set_memory_mode(app: AppHandle, minutes: u32) -> Result<(), String> {
     cfg.idle_minutes = minutes;
     cfg.save(&user_cfg(&app)).map_err(|e| e.to_string())?;
     let st = app.state::<AppState>();
-    let s = { let mut g = st.inner.lock().unwrap(); g.status.idle_minutes = minutes; g.status.clone() };
+    let s = { let mut g = st.inner.lock().unwrap(); g.status.idle_minutes = minutes; g.status.seq = next_seq(&st); g.status.clone() };
     touch(&app);
     let _ = app.emit("status", s);
     Ok(())
@@ -259,7 +288,8 @@ fn set_memory_mode(app: AppHandle, minutes: u32) -> Result<(), String> {
 #[tauri::command(async)]
 fn chat_stream(app: AppHandle, body: String, on_event: Channel<String>) -> Result<(), String> {
     // The webview is not trusted to talk to the engine directly: only the allow-listed request shape gets through (see mg_core::guard).
-    let body = guard::sanitize_chat_body(&body)?;
+    let body = guard::sanitize_chat_body(&body).map_err(|e| { diag(&app, &format!("chat request REFUSED by the request gate: {e}")); e })?;
+    diag(&app, &format!("chat request {} bytes", body.len()));
     let st = app.state::<AppState>();
     let (port, tok) = {
         let g = st.inner.lock().unwrap();
@@ -270,16 +300,32 @@ fn chat_stream(app: AppHandle, body: String, on_event: Channel<String>) -> Resul
     let r = http::post_sse(port, &tok, &body, &st.chat_cancel, |e| { let _ = on_event.send(e); });
     st.busy.store(false, Ordering::SeqCst);
     touch(&app);
+    match &r { Ok(()) => diag(&app, "chat request finished"), Err(e) => diag(&app, &format!("chat request FAILED: {e}")) }
     if r.is_err() {
-        // did the engine crash (e.g. out of memory)? then surface a recoverable error state instead of a dead chat
-        let mut g = st.inner.lock().unwrap();
-        let died = g.child.as_mut().map(|c| matches!(c.try_wait(), Ok(Some(_)))).unwrap_or(false);
-        if died {
-            g.child = None; g.conn = None; g.status.state = "error".into();
-            let log = app.path().app_log_dir().unwrap_or_else(|_| exe_dir()).join("backend.log");
-            g.status.message = format!("The inference engine stopped unexpectedly (possibly out of memory).\n{}", backend::log_tail(&log));
-            let s = g.status.clone(); drop(g); let _ = app.emit("status", s);
-        }
+        // The engine can no longer serve the chat: it crashed (e.g. out of memory), or the drive that holds the model was unplugged / the
+        // folder was moved. A missing folder opens the same re-link dialog as at start-up (and "Retry" works once the drive is back);
+        // a crash shows its log. Either way the dead engine is stopped and the chat is not left in a state that looks "ready".
+        let (child, s) = {
+            let mut g = st.inner.lock().unwrap();
+            let died = g.child.as_mut().map(|c| matches!(c.try_wait(), Ok(Some(_)))).unwrap_or(false);
+            let gone = g.conn.is_some() && backend::folder_missing(&g.status.model_dir);
+            if died || gone {
+                g.conn = None;
+                let child = g.child.take();
+                if gone {
+                    g.status.state = "need_model_folder".into();
+                    g.status.message = format!("{}. The folder \"{}\" is no longer available (drive unplugged, or the folder was moved or renamed). Connect the drive or select the folder again.", backend::MSG_NOT_FOUND, g.status.model_dir);
+                } else {
+                    g.status.state = "error".into();
+                    let log = app.path().app_log_dir().unwrap_or_else(|_| exe_dir()).join("backend.log");
+                    g.status.message = format!("The inference engine stopped unexpectedly (possibly out of memory).\n{}", backend::log_tail(&log));
+                }
+                g.status.seq = next_seq(&st);
+                (child, Some(g.status.clone()))
+            } else { (None, None) }
+        };
+        if let Some(s) = s { diag(&app, &format!("engine unavailable after a failed request -> {} {}", s.state, s.message)); let _ = app.emit("status", s); }
+        if let Some(mut ch) = child { backend::kill(&mut ch); }
     }
     r
 }
@@ -335,8 +381,10 @@ fn main() {
             chat_cancel: AtomicBool::new(false), busy: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             machine: Mutex::new(None),
+            seq: AtomicU64::new(0),
         })
-        .setup(|app| { create_main_window(app)?; bootstrap(app.handle().clone()); start_idle_watcher(app.handle().clone()); Ok(()) })
+        .setup(|app| { create_main_window(app)?; diag(app.handle(), &format!("app started, version {}", env!("CARGO_PKG_VERSION")));
+            bootstrap(app.handle().clone(), false); start_idle_watcher(app.handle().clone()); Ok(()) })
         .invoke_handler(tauri::generate_handler![get_status, pick_model_folder, retry, list_variants, choose_variant, set_compute, set_memory_mode, chat_stream, chat_cancel, save_report])
         .build(tauri::generate_context!())
         .expect("failed to build app");

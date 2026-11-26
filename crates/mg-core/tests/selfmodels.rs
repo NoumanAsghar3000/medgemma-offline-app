@@ -2,14 +2,10 @@
 //! 8-bit preference, GPU planning through the real `prepare_with`, and refusal of files that are not Gemma 3.
 //! The GGUF files are synthetic HEADERS written here (the app only ever reads the metadata section), so every rule is
 //! exercised with exactly the numbers a real 27B / 4B file carries: 62 layers / 5376 wide and 34 layers / 2560 wide.
-use mg_core::{
-    backend::prepare_with,
-    config::Config,
-    hw::Hardware,
-    plan::Bandwidth,
-    select::*,
-    GIB,
-};
+use mg_core::{plan::Bandwidth, select::*, GIB};
+// only the Linux-only GPU-planning module (sparse multi-GB files) below uses these: importing them unconditionally is an "unused import" warning on Windows
+#[cfg(unix)]
+use mg_core::{backend::prepare_with, config::Config, hw::Hardware};
 use std::{fs, path::{Path, PathBuf}};
 
 const NVME: Bandwidth = Bandwidth { ram_gbps: 40.0, disk_mbps: 3000.0 };

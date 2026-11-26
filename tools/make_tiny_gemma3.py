@@ -4,7 +4,11 @@ import sys
 import numpy as np, gguf
 OUT = sys.argv[1] if len(sys.argv) > 1 else "tiny-gemma3.gguf"
 w = gguf.GGUFWriter(OUT, "gemma3")
-E, H, KV, HD, FF, L, CTX = 64, 4, 2, 16, 128, 2, 512
+# CTX is the TRAINING context the file declares. It must be at least the context the app asks for (-c 16384 for the 4B family): recent
+# llama.cpp builds CAP the server's context to this value ("the slot context exceeds the training context of the model - capping"), and with
+# a byte-level vocabulary like this one the app's system prompt alone is longer than 512 tokens, so a 512 here makes every realistic chat
+# request fail with HTTP 400 "exceeds the available context size". The weights are random and tiny, so a large value costs nothing.
+E, H, KV, HD, FF, L, CTX = 64, 4, 2, 16, 128, 2, 32768
 w.add_name("tiny-gemma3-random"); w.add_context_length(CTX); w.add_embedding_length(E); w.add_block_count(L)
 w.add_feed_forward_length(FF); w.add_head_count(H); w.add_head_count_kv(KV); w.add_key_length(HD); w.add_value_length(HD)
 w.add_layer_norm_rms_eps(1e-6); w.add_sliding_window(128); w.add_rope_freq_base(1000000.0); w.add_file_type(0)
