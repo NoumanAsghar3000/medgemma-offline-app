@@ -30,12 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: 20, cache: npm }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
 
       - name: Real llama-server (Linux build, same server code) + tiny random Gemma-3-architecture model
@@ -77,10 +77,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: 20, cache: npm }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - run: |
           npm ci
@@ -88,7 +88,7 @@ jobs:
           pip install selenium
       - name: Drive the UI in Firefox (headless) and save screenshots
         run: python tools/ui_check.py ui-shots
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: ui-screenshots
@@ -113,12 +113,12 @@ jobs:
       # read by tools/sign.ps1 (also when Inno Setup calls it to sign the installer + uninstaller)
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with: { node-version: 20, cache: npm }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
 
       # ---- code signing: decode the PFX from the secret, sanity-check it, locate signtool.exe ----
@@ -285,7 +285,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'ISCC (old version) failed' }
 
       # The installers are delivered first: a failing test below turns the job red but never hides the artifact.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: MedGemmaOffline-installer-${{ matrix.bundle_webview2 && 'with-webview2' || 'slim' }}
           path: |
@@ -412,7 +412,7 @@ jobs:
 
       - name: Upload test evidence (wizard screenshots + state log, e2e console + app log + results + saved PDF, setup logs)
         if: always() && matrix.bundle_webview2
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-evidence
           if-no-files-found: warn
@@ -448,12 +448,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           pattern: MedGemmaOffline-installer-*
           path: artifacts
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Check both installers (real Inno Setup executables, sizes, SHA-256 sums, bundled > slim)
         run: python tools/check_artifacts.py artifacts
